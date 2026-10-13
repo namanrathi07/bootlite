@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use bootlite_core::{flash_and_verify, list_safe_usb_drives, UsbDrive};
 use eframe::egui;
 use std::path::PathBuf;
