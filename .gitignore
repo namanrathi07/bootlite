@@ -1,0 +1,7 @@
+/target
+/dist
+*.dmg
+*.iso
+*.img
+*.gz
+.DS_Store

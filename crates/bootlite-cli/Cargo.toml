@@ -1,0 +1,10 @@
+[package]
+name = "bootlite-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+bootlite-core = { path = "../bootlite-core" }
+clap.workspace = true
+indicatif.workspace = true

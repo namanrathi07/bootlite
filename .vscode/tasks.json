@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Check All Platforms (Mac + Linux + Windows)",
+      "type": "shell",
+      "command": "cargo check --target aarch64-apple-darwin && cargo check --target x86_64-unknown-linux-gnu && cargo check --target x86_64-pc-windows-gnu",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$rustc"]
+    }
+  ]
+}
