@@ -15,7 +15,7 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
     let mut candidate_ids = Vec::new();
 
     for line in stdout.lines() {
-        if line.starts_with("/dev/disk") {
+        if line.starts_with("/dev/disk") && !line.contains("synthesized") {
             let is_external = line.contains("external");
             let is_disk_image = line.contains("disk image");
             if is_external || (allow_virtual && is_disk_image) {

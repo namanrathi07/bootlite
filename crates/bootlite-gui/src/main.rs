@@ -38,13 +38,17 @@ fn is_elevated() -> bool {
     }
 }
 
-fn relaunch_elevated() -> anyhow::Result<()> {
+fn relaunch_elevated(image_arg: Option<&PathBuf>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let exe = std::env::current_exe()?;
+        let arg_str = image_arg
+            .map(|p| format!(" \"{}\"", p.display()))
+            .unwrap_or_default();
         let script = format!(
-            "do shell script \"\\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
-            exe.display()
+            "do shell script \"\\\"{}\\\"{} > /dev/null 2>&1 &\" with administrator privileges",
+            exe.display(),
+            arg_str
         );
         let status = std::process::Command::new("osascript")
             .args(["-e", &script])
@@ -73,6 +77,9 @@ fn relaunch_elevated() -> anyhow::Result<()> {
             }
         }
         cmd.arg(exe);
+        if let Some(img) = image_arg {
+            cmd.arg(img);
+        }
         if cmd.spawn().is_ok() {
             std::process::exit(0);
         } else {
@@ -104,12 +111,23 @@ fn relaunch_elevated() -> anyhow::Result<()> {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
+        let params: Vec<u16> = image_arg
+            .map(|p| format!("\"{}\"", p.display()))
+            .unwrap_or_default()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let params_ptr = if image_arg.is_some() {
+            params.as_ptr()
+        } else {
+            std::ptr::null()
+        };
         let res = unsafe {
             ShellExecuteW(
                 std::ptr::null_mut(),
                 verb.as_ptr(),
                 file.as_ptr(),
-                std::ptr::null(),
+                params_ptr,
                 std::ptr::null(),
                 1,
             )
@@ -379,7 +397,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.1.7 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.1.8 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -404,6 +422,12 @@ impl BootLiteApp {
             logs,
         };
         app.refresh_drives();
+        if let Some(arg_path) = std::env::args_os().nth(1) {
+            let p = PathBuf::from(arg_path);
+            if p.is_file() {
+                app.set_image(p);
+            }
+        }
         app
     }
 
@@ -653,7 +677,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.1.7",
+                                "v0.1.8",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -689,7 +713,7 @@ impl eframe::App for BootLiteApp {
                                 ctx.set_cursor_icon(CursorIcon::PointingHand);
                             }
                             if resp.clicked() {
-                                if let Err(e) = relaunch_elevated() {
+                                if let Err(e) = relaunch_elevated(self.image_path.as_ref()) {
                                     *self.status.lock().unwrap() = JobStatus::Error(e.to_string());
                                 }
                             }
@@ -1079,7 +1103,7 @@ impl eframe::App for BootLiteApp {
                                     }
                                     if resp.clicked() {
                                         if !self.has_root {
-                                            if let Err(e) = relaunch_elevated() {
+                                            if let Err(e) = relaunch_elevated(self.image_path.as_ref()) {
                                                 *self.status.lock().unwrap() =
                                                     JobStatus::Error(e.to_string());
                                             }

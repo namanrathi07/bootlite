@@ -6,10 +6,13 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
+const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
 
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x000700A0;
@@ -17,6 +20,7 @@ const IOCTL_DISK_CREATE_DISK: u32 = 0x0007C058;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
+const IOCTL_VOLUME_OFFLINE: u32 = 0x0056C00C;
 const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
 const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
 const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
@@ -37,6 +41,13 @@ extern "system" {
     ) -> i32;
 
     fn GetLogicalDrives() -> u32;
+    fn FindFirstVolumeW(lpsz_volume_name: *mut u16, cch_buffer_length: u32) -> RawHandle;
+    fn FindNextVolumeW(
+        h_find_volume: RawHandle,
+        lpsz_volume_name: *mut u16,
+        cch_buffer_length: u32,
+    ) -> i32;
+    fn FindVolumeClose(h_find_volume: RawHandle) -> i32;
 }
 
 #[repr(C)]
@@ -81,7 +92,7 @@ struct DiskGeometry {
 struct DiskGeometryEx {
     geometry: DiskGeometry,
     disk_size: i64,
-    data: [u8; 8],
+    data: [u8; 256],
 }
 
 #[repr(C)]
@@ -125,12 +136,11 @@ fn extract_cstr(buf: &[u8], offset: u32) -> String {
     String::from_utf8_lossy(&slice[..end]).trim().to_string()
 }
 
-fn volume_belongs_to_disk(drive_letter: char, target_disk_num: u32) -> bool {
-    let path = format!(r"\\.\{}:", drive_letter);
+fn volume_path_belongs_to_disk(vol_path: &str, target_disk_num: u32) -> bool {
     let Ok(file) = OpenOptions::new()
         .access_mode(0)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&path)
+        .open(vol_path)
     else {
         return false;
     };
@@ -167,11 +177,101 @@ fn volume_belongs_to_disk(drive_letter: char, target_disk_num: u32) -> bool {
     false
 }
 
+fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
+    let mut paths = Vec::new();
+
+    // 1. Enumerate all system volumes via FindFirstVolumeW / FindNextVolumeW
+    //    This catches hidden EFI partitions and unlettered Linux/ISO partitions!
+    let mut buf = [0u16; 260];
+    let find_handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+    if find_handle != INVALID_HANDLE_VALUE {
+        loop {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                let mut vol_str = String::from_utf16_lossy(&buf[..len]);
+                if vol_str.ends_with('\\') {
+                    vol_str.pop();
+                }
+                if volume_path_belongs_to_disk(&vol_str, target_disk_num) {
+                    paths.push(vol_str);
+                }
+            }
+            buf.fill(0);
+            let next_ok =
+                unsafe { FindNextVolumeW(find_handle, buf.as_mut_ptr(), buf.len() as u32) };
+            if next_ok == 0 {
+                break;
+            }
+        }
+        unsafe {
+            let _ = FindVolumeClose(find_handle);
+        }
+    }
+
+    // 2. Also include any logical drive letters (A:..Z:) belonging to this disk
+    let mask = unsafe { GetLogicalDrives() };
+    for i in 0..26u32 {
+        if (mask & (1 << i)) != 0 {
+            let letter = (b'A' + (i as u8)) as char;
+            if letter == 'C' {
+                continue;
+            }
+            let letter_path = format!(r"\\.\{}:", letter);
+            if volume_path_belongs_to_disk(&letter_path, target_disk_num)
+                && !paths.contains(&letter_path)
+            {
+                paths.push(letter_path);
+            }
+        }
+    }
+
+    paths
+}
+
+fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
+    let Ok(vol_file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(vol_path)
+    else {
+        return;
+    };
+
+    let h = vol_file.as_raw_handle();
+    let _ = ioctl_none(h, FSCTL_ALLOW_EXTENDED_DASD_IO);
+
+    let mut locked = false;
+    for _ in 0..5 {
+        if ioctl_none(h, FSCTL_LOCK_VOLUME) {
+            locked = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    // Dismount volume; if Explorer/Defender held open handles that blocked FSCTL_LOCK_VOLUME,
+    // FSCTL_DISMOUNT_VOLUME forcibly invalidates those handles so locking now succeeds.
+    let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
+
+    if !locked {
+        for _ in 0..5 {
+            if ioctl_none(h, FSCTL_LOCK_VOLUME) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    let _ = ioctl_none(h, IOCTL_VOLUME_OFFLINE);
+    out_handles.push(vol_file);
+}
+
 pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
     let mut drives = Vec::new();
 
     for disk_num in 0..32u32 {
-        if disk_num == 0 || volume_belongs_to_disk('C', disk_num) {
+        if disk_num == 0 || volume_path_belongs_to_disk(r"\\.\C:", disk_num) {
             continue;
         }
 
@@ -281,35 +381,15 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
     let Some(disk_num) = extract_disk_number(drive) else {
         anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
     };
-    if disk_num == 0 || drive.is_system || volume_belongs_to_disk('C', disk_num) {
+    if disk_num == 0 || drive.is_system || volume_path_belongs_to_disk(r"\\.\C:", disk_num) {
         anyhow::bail!("Safety lock: Refusing to unmount system boot drive");
     }
 
     let mut locked = LOCKED_VOLUMES.lock().unwrap();
     locked.clear();
 
-    let mask = unsafe { GetLogicalDrives() };
-    for i in 0..26u32 {
-        if (mask & (1 << i)) != 0 {
-            let letter = (b'A' + (i as u8)) as char;
-            if letter == 'C' {
-                continue;
-            }
-            if volume_belongs_to_disk(letter, disk_num) {
-                let vol_path = format!(r"\\.\{}:", letter);
-                if let Ok(vol_file) = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                    .open(&vol_path)
-                {
-                    let h = vol_file.as_raw_handle();
-                    let _ = ioctl_none(h, FSCTL_LOCK_VOLUME);
-                    let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
-                    locked.push(vol_file);
-                }
-            }
-        }
+    for vol_path in enumerate_disk_volume_paths(disk_num) {
+        lock_and_dismount_volume(&vol_path, &mut locked);
     }
 
     Ok(())
@@ -337,7 +417,6 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
     let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
     let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
 
-    // Reset partition style to RAW in kernel so even unlettered EFI/Linux partitions unlock
     let raw_disk = CreateDiskRaw {
         partition_style: 2, // PARTITION_STYLE_RAW
         data: [0u8; 20],

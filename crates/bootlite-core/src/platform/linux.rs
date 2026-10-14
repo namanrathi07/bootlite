@@ -33,7 +33,7 @@ fn get_system_mounted_devs() -> Vec<(String, String)> {
 fn is_critical_mountpoint(mnt: &str) -> bool {
     matches!(
         mnt,
-        "/" | "/boot" | "/boot/efi" | "/home" | "/usr" | "/var" | "/ nix"
+        "/" | "/boot" | "/boot/efi" | "/home" | "/usr" | "/var" | "/nix"
     ) || mnt.starts_with("/boot/")
 }
 

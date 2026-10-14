@@ -104,7 +104,6 @@ where
     platform::unmount_drive(drive)?;
 
     // 2. Open single raw hardware handle for both Write & Read-Back Verification
-    //    (Keeping the handle open prevents OS auto-mounters from hijacking the drive mid-job)
     let raw_file = platform::open_raw_device(drive)?;
     let mut guard = DeviceCleanupGuard {
         device: Some(raw_file),
@@ -124,13 +123,14 @@ where
     };
 
     let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut source_hasher = Sha256::new();
+    let mut full_source_hasher = Sha256::new();
+    let mut tail_source_hasher = Sha256::new();
     let mut total_written: u64 = 0;
     let write_start = Instant::now();
 
-    // Deferred Sector-0 Write:
-    // Hold the first 1 MB (containing MBR/GPT partition tables) in RAM and write zeros first
-    // so OS auto-mounters never see a valid partition table until all sectors are written.
+    // Hold the first 1 MB (MBR/GPT boot sector) in RAM and write zeros to Sector 0 first.
+    // Keeping Sector 0 zeroed during both Write and Verify prevents Windows, macOS, and Linux
+    // background auto-mounters from mounting the drive mid-operation.
     let mut deferred_first_chunk: Option<Vec<u8>> = None;
     let mut is_first_chunk = true;
 
@@ -154,7 +154,7 @@ where
             );
         }
 
-        source_hasher.update(&buf[..n]);
+        full_source_hasher.update(&buf[..n]);
 
         if is_first_chunk && n == CHUNK_SIZE {
             is_first_chunk = false;
@@ -165,6 +165,8 @@ where
                 .context("Failed while initializing sector 0 on raw device")?;
         } else {
             is_first_chunk = false;
+            tail_source_hasher.update(&buf[..n]);
+
             let write_len = if n % SECTOR_ALIGN != 0 {
                 let aligned = (n + SECTOR_ALIGN - 1) & !(SECTOR_ALIGN - 1);
                 buf[n..aligned].fill(0);
@@ -198,16 +200,6 @@ where
         });
     }
 
-    // Write the deferred first 1 MB (MBR/GPT boot table) to Sector 0
-    if let Some(first_chunk) = deferred_first_chunk {
-        device
-            .seek(SeekFrom::Start(0))
-            .context("Failed to seek back to sector 0 for boot record write")?;
-        device
-            .write_all(&first_chunk)
-            .context("Failed while writing boot record (sector 0) to raw device")?;
-    }
-
     on_progress(FlashProgress {
         phase: "Flushing hardware controller cache...",
         bytes_processed: total_written,
@@ -215,18 +207,27 @@ where
         speed_mbps: 0.0,
     });
 
-    // 3. Flush hardware caches & invalidate OS page cache, then rewind the SAME handle to Sector 0
     platform::prepare_for_verify(device)?;
-    device
-        .seek(SeekFrom::Start(0))
-        .context("Failed to rewind raw device to sector 0 for verification")?;
 
-    let expected_hash = format!("{:x}", source_hasher.finalize());
+    let expected_full_hash = format!("{:x}", full_source_hasher.finalize());
+    let expected_tail_hash = format!("{:x}", tail_source_hasher.finalize());
 
-    // 4. Sector-by-Sector Read-Back SHA-256 Verification
-    let mut verify_hasher = Sha256::new();
-    let mut verified_bytes: u64 = 0;
+    // 3. Sector-by-Sector Read-Back Verification
+    //    First verify all sectors after Sector 0 while Sector 0 is STILL zeroed out
+    //    so no OS auto-mounter can claim the drive during the multi-minute read-back!
     let verify_start = Instant::now();
+    let mut tail_verify_hasher = Sha256::new();
+    let mut verified_bytes: u64 = if deferred_first_chunk.is_some() {
+        device
+            .seek(SeekFrom::Start(CHUNK_SIZE as u64))
+            .context("Failed to seek to 1 MB offset for verification")?;
+        CHUNK_SIZE as u64
+    } else {
+        device
+            .seek(SeekFrom::Start(0))
+            .context("Failed to seek to sector 0 for verification")?;
+        0
+    };
 
     while verified_bytes < total_written {
         if let Some(flag) = cancel_flag {
@@ -248,7 +249,7 @@ where
             );
         }
 
-        verify_hasher.update(&buf[..to_read]);
+        tail_verify_hasher.update(&buf[..to_read]);
         verified_bytes += to_read as u64;
 
         let elapsed = verify_start.elapsed().as_secs_f64().max(0.001);
@@ -262,14 +263,36 @@ where
         });
     }
 
-    let actual_hash = format!("{:x}", verify_hasher.finalize());
-    if actual_hash != expected_hash {
+    let actual_tail_hash = format!("{:x}", tail_verify_hasher.finalize());
+    if actual_tail_hash != expected_tail_hash {
         anyhow::bail!(
-            "SHA-256 verification mismatch! Source: {}, Device: {}",
-            expected_hash,
-            actual_hash
+            "SHA-256 verification mismatch on data sectors! Expected: {}, Actual: {}",
+            expected_tail_hash,
+            actual_tail_hash
         );
     }
 
-    Ok(actual_hash)
+    // 4. Final 50ms Commit: Write the deferred 1 MB MBR/GPT boot record to Sector 0,
+    //    flush hardware cache, and immediately verify Sector 0 from physical flash.
+    if let Some(first_chunk) = deferred_first_chunk {
+        device
+            .seek(SeekFrom::Start(0))
+            .context("Failed to seek to sector 0 for boot record commit")?;
+        device
+            .write_all(&first_chunk)
+            .context("Failed while writing boot record (sector 0) to raw device")?;
+
+        platform::prepare_for_verify(device)?;
+
+        device
+            .seek(SeekFrom::Start(0))
+            .context("Failed to rewind to sector 0 for boot record verification")?;
+        let n = read_full_chunk(device, &mut buf[..CHUNK_SIZE])
+            .context("Failed while reading back boot record (sector 0)")?;
+        if n != CHUNK_SIZE || buf[..CHUNK_SIZE] != first_chunk[..] {
+            anyhow::bail!("Boot record (sector 0) read-back verification mismatch!");
+        }
+    }
+
+    Ok(expected_full_hash)
 }
