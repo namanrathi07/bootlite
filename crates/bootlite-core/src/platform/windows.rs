@@ -1,91 +1,228 @@
 use crate::UsbDrive;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::fs::{self, File};
+use std::ffi::c_void;
+use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
 const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
-const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+const FILE_SHARE_READ: u32 = 0x00000001;
+const FILE_SHARE_WRITE: u32 = 0x00000002;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-#[derive(Deserialize)]
-struct WinDisk {
-    #[serde(rename = "Number")]
-    number: u32,
-    #[serde(rename = "FriendlyName", default)]
-    friendly_name: String,
-    #[serde(rename = "Size", default)]
-    size: u64,
-    #[serde(rename = "BusType", default)]
-    bus_type: String,
-    #[serde(rename = "IsSystem", default)]
-    is_system: bool,
-    #[serde(rename = "IsBoot", default)]
-    is_boot: bool,
+// Win32 Disk & Volume Control Codes
+const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
+const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
+const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
+const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
+const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn DeviceIoControl(
+        hDevice: RawHandle,
+        dwIoControlCode: u32,
+        lpInBuffer: *const c_void,
+        nInBufferSize: u32,
+        lpOutBuffer: *mut c_void,
+        nOutBufferSize: u32,
+        lpBytesReturned: *mut u32,
+        lpOverlapped: *mut c_void,
+    ) -> i32;
 }
 
-pub fn list_drives(_include_virtual: bool) -> Result<Vec<UsbDrive>> {
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsSystem,IsBoot | ConvertTo-Json -Compress",
-        ])
-        .output()
-        .context("Failed to query Windows disks via PowerShell")?;
+fn ioctl_none(handle: RawHandle, code: u32) -> bool {
+    let mut bytes_returned: u32 = 0;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            code,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if stdout.trim().is_empty() {
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WinDisk {
+    number: u32,
+    friendly_name: Option<String>,
+    size: u64,
+    bus_type: Option<String>,
+    is_system: Option<bool>,
+    is_boot: Option<bool>,
+}
+
+pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
+    let ps_script = "Get-Disk | Select-Object Number, FriendlyName, Size, BusType, IsSystem, IsBoot | ConvertTo-Json -Compress";
+    let output = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", ps_script])
+        .output()
+        .context("Failed to execute PowerShell Get-Disk")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
         return Ok(Vec::new());
     }
 
-    let disks: Vec<WinDisk> = if stdout.trim_start().starts_with('[') {
+    let disks: Vec<WinDisk> = if stdout.starts_with('[') {
         serde_json::from_str(&stdout).unwrap_or_default()
+    } else if let Ok(single) = serde_json::from_str::<WinDisk>(&stdout) {
+        vec![single]
     } else {
-        serde_json::from_str::<WinDisk>(&stdout)
-            .map(|d| vec![d])
-            .unwrap_or_default()
+        Vec::new()
     };
 
-    let mut result = Vec::new();
+    let mut drives = Vec::new();
     for d in disks {
-        let is_sys = d.is_system || d.is_boot || d.number == 0;
-        let is_usb =
-            d.bus_type.eq_ignore_ascii_case("USB") || d.bus_type.eq_ignore_ascii_case("SD");
-
-        if is_usb && !is_sys && d.size > 0 {
-            let id = format!("PhysicalDrive{}", d.number);
-            result.push(UsbDrive {
-                raw_device_path: PathBuf::from(format!(r"\\.\{}", id)),
-                id,
-                model: d.friendly_name,
-                bus: d.bus_type,
-                size_bytes: d.size,
-                is_system: is_sys,
-                is_virtual: false,
-            });
+        if d.is_system.unwrap_or(false) || d.is_boot.unwrap_or(false) || d.number == 0 {
+            continue;
         }
+        let bus = d.bus_type.unwrap_or_else(|| "Unknown".to_string());
+        let is_usb = bus.eq_ignore_ascii_case("USB");
+        let is_virtual = bus.eq_ignore_ascii_case("File Backed Virtual")
+            || bus.eq_ignore_ascii_case("Spaces");
+
+        if !is_usb && !(allow_virtual && is_virtual) {
+            continue;
+        }
+
+        let id = format!("PhysicalDrive{}", d.number);
+        let raw_path = PathBuf::from(format!(r"\\.\{}", id));
+        drives.push(UsbDrive {
+            id,
+            model: d.friendly_name.unwrap_or_else(|| "USB Storage".to_string()),
+            size_bytes: d.size,
+            raw_device_path: raw_path.clone(),
+            block_device_path: raw_path,
+            bus,
+        });
     }
-    Ok(result)
+
+    Ok(drives)
 }
 
-pub fn prepare_and_open_raw_device(drive: &UsbDrive) -> Result<File> {
-    if drive.is_system {
-        bail!("SAFETY ABORT: Refusing to open Windows system disk!");
+fn extract_disk_number(drive: &UsbDrive) -> Option<u32> {
+    drive
+        .id
+        .strip_prefix("PhysicalDrive")
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
+    let Some(disk_num) = extract_disk_number(drive) else {
+        anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
+    };
+    if disk_num == 0 {
+        anyhow::bail!("Safety lock: Refusing to clean PhysicalDrive0 (system boot drive)");
     }
 
-    let file = fs::OpenOptions::new()
+    // 1. Ask PowerShell to query any mounted drive letters on this disk so we can lock/dismount them via Win32
+    let query_letters = format!(
+        "(Get-Partition -DiskNumber {} -ErrorAction SilentlyContinue | Where-Object DriveLetter | ForEach-Object {{ $_.DriveLetter }})",
+        disk_num
+    );
+    if let Ok(out) = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", &query_letters])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let letter = line.trim().chars().next();
+            if let Some(ch) = letter {
+                if ch.is_ascii_alphabetic() {
+                    let vol_path = format!(r"\\.\{}:", ch);
+                    if let Ok(vol_file) = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                        .open(&vol_path)
+                    {
+                        let h = vol_file.as_raw_handle();
+                        let _ = ioctl_none(h, FSCTL_LOCK_VOLUME);
+                        let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Wipe existing partitions on the disk so Windows releases all partition boundary locks
+    let clean_ps = format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         Set-Disk -Number {0} -IsReadOnly $false; \
+         if ((Get-Disk -Number {0}).PartitionStyle -ne 'RAW') {{ \
+             Clear-Disk -Number {0} -RemoveData -RemoveOEM -Confirm:$false \
+         }}",
+        disk_num
+    );
+    let _ = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", &clean_ps])
+        .status();
+
+    Ok(())
+}
+
+pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
+    if drive.id == "PhysicalDrive0" {
+        anyhow::bail!("Safety lock: Refusing to open PhysicalDrive0 for writing");
+    }
+
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_WRITE_THROUGH)
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {}. Run terminal as Administrator.",
+                "Failed to open {} for raw write (Ensure BootLite is running as Administrator)",
                 drive.raw_device_path.display()
             )
         })?;
 
+    let handle = file.as_raw_handle();
+    // Destroy any kernel-cached partition layout and disable partition boundary checks
+    let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
+    let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
+    let _ = ioctl_none(handle, IOCTL_DISK_UPDATE_PROPERTIES);
+
     Ok(file)
+}
+
+pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&drive.raw_device_path)
+        .with_context(|| {
+            format!(
+                "Failed to open {} for verification read-back",
+                drive.raw_device_path.display()
+            )
+        })?;
+
+    let handle = file.as_raw_handle();
+    let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
+
+    Ok(file)
+}
+
+pub fn flush_and_sync(file: &mut File) -> Result<()> {
+    file.sync_all()
+        .context("Failed to flush Windows hardware buffers")?;
+    // Notify Windows to re-read the newly flashed partition table after all writes finish
+    let _ = ioctl_none(file.as_raw_handle(), IOCTL_DISK_UPDATE_PROPERTIES);
+    Ok(())
 }
