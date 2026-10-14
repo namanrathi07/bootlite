@@ -11,7 +11,6 @@ use std::thread;
 // Studio Dark Palette (Linear / Raycast / Etcher inspired)
 const BG_APP: Color32 = Color32::from_rgb(11, 15, 25);         // Deep Obsidian
 const BG_CARD: Color32 = Color32::from_rgb(20, 27, 45);        // Elevated Slate
-const BG_CARD_HOVER: Color32 = Color32::from_rgb(28, 38, 62);  // Hover Slate
 const BG_SELECTED: Color32 = Color32::from_rgb(23, 43, 97);    // Active Indigo Tint
 const BORDER_DIM: Color32 = Color32::from_rgb(40, 52, 78);     // Subtle Hairline
 const ACCENT_PRIMARY: Color32 = Color32::from_rgb(59, 130, 246);// Electric Blue
