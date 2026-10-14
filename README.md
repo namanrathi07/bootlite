@@ -4,6 +4,8 @@
 [![Latest Release](https://img.shields.io/github/v/release/namanrathi07/bootlite?color=blue)](https://github.com/namanrathi07/bootlite/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+![BootLite Dark-Mode UI](docs/screenshot.png)
+
 **BootLite** is a fast, zero-bloat, cross-platform USB image flasher (`macOS`, `Linux`, `Windows`) written in pure Rust.
 
 ---
