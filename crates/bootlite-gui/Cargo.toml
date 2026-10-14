@@ -8,3 +8,6 @@ anyhow.workspace = true
 bootlite-core = { path = "../bootlite-core" }
 eframe.workspace = true
 rfd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
