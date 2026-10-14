@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB (256 x 4096-byte sectors)
@@ -30,6 +31,29 @@ pub struct FlashProgress<'a> {
     pub bytes_processed: u64,
     pub total_bytes: u64,
     pub speed_mbps: f64,
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+struct DeviceCleanupGuard {
+    device: Option<File>,
+}
+
+impl Drop for DeviceCleanupGuard {
+    fn drop(&mut self) {
+        platform::finish_device(self.device.take());
+    }
 }
 
 pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
@@ -60,7 +84,7 @@ where
 {
     let img_file = File::open(image_path)
         .with_context(|| format!("Failed to open image file: {}", image_path.display()))?;
-    let file_len = img_file.metadata()?.len();
+    let file_len = img_file.metadata()?.len().max(1);
 
     let is_gz = image_path
         .extension()
@@ -76,16 +100,27 @@ where
         );
     }
 
-    // 1. Unmount & clear existing partition locks on target USB drive
+    // 1. Unmount & lock target USB drive volumes
     platform::unmount_drive(drive)?;
 
-    // 2. Open raw hardware device
-    let mut writer = platform::open_raw_device(drive)?;
+    // 2. Open single raw hardware handle for both Write & Read-Back Verification
+    //    (Keeping the handle open prevents OS auto-mounters from hijacking the drive mid-job)
+    let raw_file = platform::open_raw_device(drive)?;
+    let mut guard = DeviceCleanupGuard {
+        device: Some(raw_file),
+    };
+    let device = guard.device.as_mut().unwrap();
+
+    let compressed_pos = Arc::new(AtomicU64::new(0));
+    let counting_file = CountingReader {
+        inner: img_file,
+        bytes_read: Arc::clone(&compressed_pos),
+    };
 
     let mut reader: Box<dyn Read> = if is_gz {
-        Box::new(GzDecoder::new(img_file))
+        Box::new(GzDecoder::new(counting_file))
     } else {
-        Box::new(img_file)
+        Box::new(counting_file)
     };
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -93,9 +128,9 @@ where
     let mut total_written: u64 = 0;
     let write_start = Instant::now();
 
-    // Rufus-style Deferred Sector-0 Write:
-    // Hold the first 1 MB (containing MBR/GPT partition tables) in memory and write zeros first
-    // so Windows Plug-and-Play never auto-mounts the new partition table mid-flash.
+    // Deferred Sector-0 Write:
+    // Hold the first 1 MB (containing MBR/GPT partition tables) in RAM and write zeros first
+    // so OS auto-mounters never see a valid partition table until all sectors are written.
     let mut deferred_first_chunk: Option<Vec<u8>> = None;
     let mut is_first_chunk = true;
 
@@ -125,7 +160,7 @@ where
             is_first_chunk = false;
             deferred_first_chunk = Some(buf[..n].to_vec());
             let zero_sector_block = vec![0u8; CHUNK_SIZE];
-            writer
+            device
                 .write_all(&zero_sector_block)
                 .context("Failed while initializing sector 0 on raw device")?;
         } else {
@@ -138,7 +173,7 @@ where
                 n
             };
 
-            writer
+            device
                 .write_all(&buf[..write_len])
                 .context("Failed while writing chunk to raw device")?;
         }
@@ -146,44 +181,49 @@ where
         total_written += n as u64;
         let elapsed = write_start.elapsed().as_secs_f64().max(0.001);
         let speed_mbps = (total_written as f64 / (1024.0 * 1024.0)) / elapsed;
+
         let est_total = if is_gz {
-            total_written.max(file_len)
+            let comp_read = compressed_pos.load(Ordering::Relaxed).max(1);
+            let ratio = (comp_read as f64 / file_len as f64).clamp(0.01, 1.0);
+            ((total_written as f64) / ratio).round() as u64
         } else {
             file_len
         };
 
         on_progress(FlashProgress {
-            phase: "Writing raw image...",
+            phase: "Phase 1/2: Writing raw sectors...",
             bytes_processed: total_written,
-            total_bytes: est_total,
+            total_bytes: est_total.max(total_written),
             speed_mbps,
         });
     }
 
-    // Write the deferred first 1 MB (MBR/GPT boot table) to Sector 0 now that all data sectors are written
+    // Write the deferred first 1 MB (MBR/GPT boot table) to Sector 0
     if let Some(first_chunk) = deferred_first_chunk {
-        writer
+        device
             .seek(SeekFrom::Start(0))
             .context("Failed to seek back to sector 0 for boot record write")?;
-        writer
+        device
             .write_all(&first_chunk)
             .context("Failed while writing boot record (sector 0) to raw device")?;
     }
 
     on_progress(FlashProgress {
-        phase: "Flushing hardware cache...",
+        phase: "Flushing hardware controller cache...",
         bytes_processed: total_written,
         total_bytes: total_written,
         speed_mbps: 0.0,
     });
 
-    platform::flush_and_sync(&mut writer)?;
-    drop(writer);
+    // 3. Flush hardware caches & invalidate OS page cache, then rewind the SAME handle to Sector 0
+    platform::prepare_for_verify(device)?;
+    device
+        .seek(SeekFrom::Start(0))
+        .context("Failed to rewind raw device to sector 0 for verification")?;
 
     let expected_hash = format!("{:x}", source_hasher.finalize());
 
-    // 3. Sector-by-Sector Read-Back SHA-256 Verification
-    let mut verify_reader = platform::open_raw_device_read(drive)?;
+    // 4. Sector-by-Sector Read-Back SHA-256 Verification
     let mut verify_hasher = Sha256::new();
     let mut verified_bytes: u64 = 0;
     let verify_start = Instant::now();
@@ -198,7 +238,7 @@ where
         let to_read = ((total_written - verified_bytes) as usize).min(CHUNK_SIZE);
         let aligned_read = (to_read + SECTOR_ALIGN - 1) & !(SECTOR_ALIGN - 1);
 
-        let n = read_full_chunk(&mut verify_reader, &mut buf[..aligned_read])
+        let n = read_full_chunk(device, &mut buf[..aligned_read])
             .context("Failed while reading back from raw device during verification")?;
         if n < to_read {
             anyhow::bail!(
@@ -215,7 +255,7 @@ where
         let speed_mbps = (verified_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
 
         on_progress(FlashProgress {
-            phase: "Verifying SHA-256...",
+            phase: "Phase 2/2: Verifying SHA-256...",
             bytes_processed: verified_bytes,
             total_bytes: total_written,
             speed_mbps,

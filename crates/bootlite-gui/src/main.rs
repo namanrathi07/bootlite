@@ -9,20 +9,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-// Studio Dark Palette
-const BG_APP: Color32 = Color32::from_rgb(11, 15, 25);          // Deep Obsidian
-const BG_CARD: Color32 = Color32::from_rgb(20, 27, 45);         // Elevated Slate
-const BG_TERMINAL: Color32 = Color32::from_rgb(7, 10, 18);      // Terminal Console Dark
-const BG_SELECTED: Color32 = Color32::from_rgb(23, 43, 97);     // Active Indigo Tint
-const BORDER_DIM: Color32 = Color32::from_rgb(40, 52, 78);      // Subtle Hairline
-const ACCENT_PRIMARY: Color32 = Color32::from_rgb(59, 130, 246);// Electric Blue
-const ACCENT_GLOW: Color32 = Color32::from_rgb(96, 165, 250);   // Lighter Blue
-const ACCENT_SUCCESS: Color32 = Color32::from_rgb(16, 185, 129);// Emerald
-const ACCENT_WARN: Color32 = Color32::from_rgb(245, 158, 11);   // Amber
-const ACCENT_DANGER: Color32 = Color32::from_rgb(239, 68, 68);  // Crimson
-const TEXT_MAIN: Color32 = Color32::from_rgb(248, 250, 252);    // Crisp White
-const TEXT_SUB: Color32 = Color32::from_rgb(148, 163, 184);     // Muted Slate
-const TEXT_DIM: Color32 = Color32::from_rgb(100, 116, 139);     // Dim Slate
+const BG_APP: Color32 = Color32::from_rgb(11, 15, 25);
+const BG_CARD: Color32 = Color32::from_rgb(20, 27, 45);
+const BG_TERMINAL: Color32 = Color32::from_rgb(7, 10, 18);
+const BG_SELECTED: Color32 = Color32::from_rgb(23, 43, 97);
+const BORDER_DIM: Color32 = Color32::from_rgb(40, 52, 78);
+const ACCENT_PRIMARY: Color32 = Color32::from_rgb(59, 130, 246);
+const ACCENT_GLOW: Color32 = Color32::from_rgb(96, 165, 250);
+const ACCENT_SUCCESS: Color32 = Color32::from_rgb(16, 185, 129);
+const ACCENT_WARN: Color32 = Color32::from_rgb(245, 158, 11);
+const ACCENT_DANGER: Color32 = Color32::from_rgb(239, 68, 68);
+const TEXT_MAIN: Color32 = Color32::from_rgb(248, 250, 252);
+const TEXT_SUB: Color32 = Color32::from_rgb(148, 163, 184);
+const TEXT_DIM: Color32 = Color32::from_rgb(100, 116, 139);
 
 fn is_elevated() -> bool {
     #[cfg(unix)]
@@ -60,11 +59,24 @@ fn relaunch_elevated() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let exe = std::env::current_exe()?;
-        let status = std::process::Command::new("pkexec").arg(exe).spawn();
-        if status.is_ok() {
+        let mut cmd = std::process::Command::new("pkexec");
+        cmd.arg("env");
+        for key in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.arg(format!("{}={}", key, val));
+            }
+        }
+        cmd.arg(exe);
+        if cmd.spawn().is_ok() {
             std::process::exit(0);
         } else {
-            anyhow::bail!("Failed to launch via pkexec.");
+            anyhow::bail!("Failed to launch elevated session via pkexec.");
         }
     }
 
@@ -150,11 +162,11 @@ fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: impl Into<String>) {
 
 fn os_io_mode_description() -> &'static str {
     if cfg!(target_os = "macos") {
-        "macOS Raw Character Device (/dev/rdiskN) + F_NOCACHE (Direct Unbuffered DMA)"
+        "macOS Raw Character Device (/dev/rdiskN) + F_NOCACHE / F_FULLFSYNC"
     } else if cfg!(target_os = "linux") {
-        "Linux Block Device + O_SYNC (Direct Synchronous Hardware I/O)"
+        "Linux /sys/block Direct + O_SYNC + BLKFLSBUF Cache Bypass"
     } else {
-        "Windows PhysicalDrive + FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH"
+        "Windows Win32 PhysicalDrive + IOCTL_DISK_CREATE_DISK + WRITE_THROUGH"
     }
 }
 
@@ -367,12 +379,15 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.1.6 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.1.7 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
         } else {
-            push_log(&logs, "Privilege Check: Running as standard user (Elevation required before flashing)");
+            push_log(
+                &logs,
+                "Privilege Check: Running as standard user (Click 'Unlock Admin Access' to flash)",
+            );
         }
 
         let mut app = Self {
@@ -484,7 +499,7 @@ impl BootLiteApp {
         );
         push_log(
             &logs_clone,
-            format!("Unmounting existing OS volumes on {}...", drive.id),
+            format!("Unmounting & locking existing OS volumes on {}...", drive.id),
         );
 
         *status_clone.lock().unwrap() = JobStatus::Running {
@@ -518,7 +533,6 @@ impl BootLiteApp {
                     None
                 };
 
-                // Detect phase transitions for behind-the-scenes Rufus-style logging
                 if prog.phase != last_phase {
                     last_phase = prog.phase.to_string();
                     last_logged_bucket = 0;
@@ -527,24 +541,20 @@ impl BootLiteApp {
                         push_log(
                             &logs_clone,
                             format!(
-                                "Opened {} in unbuffered raw mode (1 MB block size)",
+                                "Opened {} in unbuffered raw mode (Sector 0 deferred until stream completion)",
                                 drive.raw_device_path.display()
                             ),
                         );
+                    } else if last_phase.contains("Flushing") {
                         push_log(
                             &logs_clone,
-                            "Streaming sectors to hardware & calculating source SHA-256 on the fly...",
-                        );
-                    } else if last_phase.contains("Syncing") || last_phase.contains("Flushing") {
-                        push_log(
-                            &logs_clone,
-                            "Write stream complete — flushing hardware controller buffers (fsync)...",
+                            "Boot record written to Sector 0 — flushing physical controller buffers...",
                         );
                     } else if last_phase.contains("Verifying") {
                         push_log(
                             &logs_clone,
                             format!(
-                                "Hardware buffers flushed. Re-reading {} from sector 0 for SHA-256 verification...",
+                                "Rewinding locked raw handle to Sector 0 — verifying {} via hardware SHA-256 read-back...",
                                 format_bytes(prog.total_bytes)
                             ),
                         );
@@ -553,7 +563,6 @@ impl BootLiteApp {
                     }
                 }
 
-                // Log every 25% milestone per phase
                 let pct = (fraction * 100.0) as u64;
                 let bucket = pct / 25;
                 if bucket > last_logged_bucket && bucket <= 4 && prog.bytes_processed > 0 {
@@ -585,11 +594,11 @@ impl BootLiteApp {
             let total_elapsed = job_start.elapsed().as_secs();
             match result {
                 Ok(hash) => {
-                    push_log(&logs_clone, format!("Computed SHA-256: {}", hash));
+                    push_log(&logs_clone, format!("Verified SHA-256: {}", hash));
                     push_log(
                         &logs_clone,
                         format!(
-                            "✔ SUCCESS: Sector-by-sector verification matched in {}",
+                            "[OK] Sector-by-sector verification matched in {}",
                             format_duration(total_elapsed)
                         ),
                     );
@@ -600,7 +609,7 @@ impl BootLiteApp {
                 }
                 Err(err) => {
                     let err_msg = format!("{:#}", err);
-                    push_log(&logs_clone, format!("✖ ERROR: {}", err_msg));
+                    push_log(&logs_clone, format!("[ERROR] {}", err_msg));
                     *status_clone.lock().unwrap() = JobStatus::Error(err_msg);
                 }
             }
@@ -612,6 +621,7 @@ impl eframe::App for BootLiteApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let current_status = self.status.lock().unwrap().clone();
         let is_running = matches!(current_status, JobStatus::Running { .. });
+        let is_hovering_file = ctx.input(|i| !i.raw.hovered_files.is_empty());
 
         if is_running {
             ctx.request_repaint();
@@ -629,9 +639,7 @@ impl eframe::App for BootLiteApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(BG_APP).inner_margin(22.0))
             .show(ctx, |ui| {
-                // ─────────────────────────────────────────────────────────────
-                // TOP NAVIGATION & BRAND HEADER
-                // ─────────────────────────────────────────────────────────────
+                // HEADER
                 ui.horizontal(|ui| {
                     draw_brand_logo(ui);
                     ui.add_space(4.0);
@@ -645,7 +653,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.1.6",
+                                "v0.1.7",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -691,9 +699,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(12.0);
 
-                // ─────────────────────────────────────────────────────────────
                 // 3-STAGE PIPELINE STEPPER BAR
-                // ─────────────────────────────────────────────────────────────
                 let step1_done = self.image_path.is_some();
                 let step2_done = self.selected_drive_idx.is_some();
                 let step3_done = matches!(current_status, JobStatus::Success { .. });
@@ -758,71 +764,90 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(12.0);
 
-                // ─────────────────────────────────────────────────────────────
-                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD
-                // ─────────────────────────────────────────────────────────────
+                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD (Lights up on drag hover)
                 let has_img = self.image_path.is_some();
-                let card1_border = if has_img {
+                let card1_border = if is_hovering_file {
+                    ACCENT_GLOW
+                } else if has_img {
                     Color32::from_rgb(37, 99, 235)
                 } else {
                     BORDER_DIM
                 };
+                let card1_fill = if is_hovering_file {
+                    BG_SELECTED
+                } else {
+                    BG_CARD
+                };
 
                 egui::Frame::default()
-                    .fill(BG_CARD)
-                    .stroke(Stroke::new(1.2_f32, card1_border))
+                    .fill(card1_fill)
+                    .stroke(Stroke::new(1.4_f32, card1_border))
                     .rounding(12.0)
                     .inner_margin(14.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            draw_disc_icon(ui, has_img);
+                            draw_disc_icon(ui, has_img || is_hovering_file);
                             ui.add_space(6.0);
 
                             ui.vertical(|ui| {
-                                match &self.image_path {
-                                    Some(p) => {
-                                        let name = p
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| p.display().to_string());
-                                        ui.horizontal(|ui| {
+                                if is_hovering_file {
+                                    ui.label(
+                                        RichText::new("Release Mouse to Load Bootable Disk Image")
+                                            .size(14.0)
+                                            .strong()
+                                            .color(ACCENT_GLOW),
+                                    );
+                                    ui.label(
+                                        RichText::new("Ready to inspect image size and stream mode")
+                                            .size(12.0)
+                                            .color(TEXT_MAIN),
+                                    );
+                                } else {
+                                    match &self.image_path {
+                                        Some(p) => {
+                                            let name = p
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| p.display().to_string());
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(name)
+                                                        .size(14.0)
+                                                        .strong()
+                                                        .color(TEXT_MAIN),
+                                                );
+                                                draw_pill(
+                                                    ui,
+                                                    &format_bytes(self.image_size),
+                                                    Color32::from_rgb(30, 58, 138),
+                                                    ACCENT_GLOW,
+                                                );
+                                            });
                                             ui.label(
-                                                RichText::new(name)
+                                                RichText::new(p.display().to_string())
+                                                    .size(11.5)
+                                                    .color(TEXT_SUB),
+                                            );
+                                        }
+                                        None => {
+                                            ui.label(
+                                                RichText::new("Select Bootable OS Image")
                                                     .size(14.0)
                                                     .strong()
                                                     .color(TEXT_MAIN),
                                             );
-                                            draw_pill(
-                                                ui,
-                                                &format_bytes(self.image_size),
-                                                Color32::from_rgb(30, 58, 138),
-                                                ACCENT_GLOW,
-                                            );
-                                        });
-                                        ui.label(
-                                            RichText::new(p.display().to_string())
-                                                .size(11.5)
-                                                .color(TEXT_SUB),
-                                        );
-                                    }
-                                    None => {
-                                        ui.label(
-                                            RichText::new("Select Bootable OS Image")
-                                                .size(14.0)
-                                                .strong()
-                                                .color(TEXT_MAIN),
-                                        );
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("Drag & drop file anywhere or browse")
-                                                    .size(12.0)
-                                                    .color(TEXT_SUB),
-                                            );
-                                            draw_pill(ui, "ISO", Color32::from_rgb(30, 41, 59), TEXT_SUB);
-                                            draw_pill(ui, "IMG", Color32::from_rgb(30, 41, 59), TEXT_SUB);
-                                            draw_pill(ui, "DMG", Color32::from_rgb(30, 41, 59), TEXT_SUB);
-                                            draw_pill(ui, "GZ", Color32::from_rgb(30, 41, 59), TEXT_SUB);
-                                        });
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("Drag & drop file anywhere or browse")
+                                                        .size(12.0)
+                                                        .color(TEXT_SUB),
+                                                );
+                                                draw_pill(ui, "ISO", Color32::from_rgb(30, 41, 59), TEXT_SUB);
+                                                draw_pill(ui, "IMG", Color32::from_rgb(30, 41, 59), TEXT_SUB);
+                                                draw_pill(ui, "DMG", Color32::from_rgb(30, 41, 59), TEXT_SUB);
+                                                draw_pill(ui, "GZ", Color32::from_rgb(30, 41, 59), TEXT_SUB);
+                                            });
+                                        }
                                     }
                                 }
                             });
@@ -859,9 +884,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(10.0);
 
-                // ─────────────────────────────────────────────────────────────
                 // STEP 2: TARGET USB DRIVE SELECTOR CARD
-                // ─────────────────────────────────────────────────────────────
                 egui::Frame::default()
                     .fill(BG_CARD)
                     .stroke(Stroke::new(1.2_f32, BORDER_DIM))
@@ -1017,9 +1040,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(12.0);
 
-                // ─────────────────────────────────────────────────────────────
                 // STEP 3: ACTION BAR & LIVE TELEMETRY WITH ETA
-                // ─────────────────────────────────────────────────────────────
                 let can_flash = !is_running
                     && self.image_path.is_some()
                     && self.selected_drive_idx.is_some()
@@ -1107,7 +1128,7 @@ impl eframe::App for BootLiteApp {
                                             {
                                                 push_log(
                                                     &self.logs,
-                                                    "⚠ User requested abort — stopping I/O stream...",
+                                                    "[WARN] User requested abort — stopping I/O stream...",
                                                 );
                                                 self.cancel_flag.store(true, Ordering::Relaxed);
                                             }
@@ -1160,9 +1181,15 @@ impl eframe::App for BootLiteApp {
                             .inner_margin(12.0)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
+                                    draw_pill(
+                                        ui,
+                                        "VERIFIED",
+                                        Color32::from_rgb(6, 78, 59),
+                                        ACCENT_SUCCESS,
+                                    );
                                     ui.label(
                                         RichText::new(format!(
-                                            "✔ Flash & SHA-256 Verification Passed ({})",
+                                            "Flash & Hardware SHA-256 Read-Back Complete ({})",
                                             format_duration(elapsed_secs)
                                         ))
                                         .size(13.0)
@@ -1197,8 +1224,14 @@ impl eframe::App for BootLiteApp {
                             .inner_margin(12.0)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
+                                    draw_pill(
+                                        ui,
+                                        "FAILED",
+                                        Color32::from_rgb(127, 29, 29),
+                                        Color32::from_rgb(252, 165, 165),
+                                    );
                                     ui.label(
-                                        RichText::new(format!("Error: {}", err))
+                                        RichText::new(&err)
                                             .size(12.5)
                                             .color(Color32::from_rgb(252, 165, 165)),
                                     );
@@ -1217,9 +1250,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(12.0);
 
-                // ─────────────────────────────────────────────────────────────
                 // RUFUS-STYLE BEHIND-THE-SCENES LIVE ENGINE LOG CONSOLE
-                // ─────────────────────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("LIVE HARDWARE & VERIFICATION LOG")
@@ -1263,14 +1294,14 @@ impl eframe::App for BootLiteApp {
                                     ui.set_width(ui.available_width());
                                     let entries = self.logs.lock().unwrap().clone();
                                     for line in entries {
-                                        let color = if line.contains("✔") || line.contains("SUCCESS") {
+                                        let color = if line.contains("[OK]") {
                                             ACCENT_SUCCESS
-                                        } else if line.contains("✖") || line.contains("ERROR") {
+                                        } else if line.contains("[ERROR]") {
                                             ACCENT_DANGER
-                                        } else if line.contains("⚠") {
+                                        } else if line.contains("[WARN]") {
                                             ACCENT_WARN
                                         } else if line.contains("STARTING FLASH JOB")
-                                            || line.contains("Computed SHA-256")
+                                            || line.contains("Verified SHA-256")
                                         {
                                             ACCENT_GLOW
                                         } else {

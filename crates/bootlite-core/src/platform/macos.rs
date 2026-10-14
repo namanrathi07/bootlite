@@ -121,7 +121,7 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {} for writing (Try unlocking Admin access)",
+                "Failed to open {} for writing (Click 'Unlock Admin Access' first)",
                 drive.raw_device_path.display()
             )
         })?;
@@ -130,22 +130,14 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
     Ok(file)
 }
 
-pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .open(&drive.raw_device_path)
-        .with_context(|| {
-            format!(
-                "Failed to open {} for verification read-back",
-                drive.raw_device_path.display()
-            )
-        })?;
-
-    enable_nocache(&file)?;
-    Ok(file)
-}
-
-pub fn flush_and_sync(file: &mut File) -> Result<()> {
+pub fn prepare_for_verify(file: &mut File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    unsafe {
+        let _ = libc::fcntl(fd, libc::F_FULLFSYNC, 0);
+        let _ = libc::fcntl(fd, libc::F_NOCACHE, 1);
+    }
     file.sync_all()
-        .context("Failed to flush hardware cache (fsync)")
+        .context("Failed to flush macOS hardware cache")
 }
+
+pub fn finish_device(_file: Option<File>) {}

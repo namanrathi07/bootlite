@@ -11,9 +11,9 @@ const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
 
-// Win32 Disk, Volume & Storage IOCTL Codes
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x000700A0;
+const IOCTL_DISK_CREATE_DISK: u32 = 0x0007C058;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
@@ -21,8 +21,6 @@ const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
 const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
 const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
 
-// Hold locked volume handles open for the entire duration of the flash
-// so Windows Explorer / AutoMount cannot re-mount the drive mid-write.
 static LOCKED_VOLUMES: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 #[link(name = "kernel32")]
@@ -39,6 +37,12 @@ extern "system" {
     ) -> i32;
 
     fn GetLogicalDrives() -> u32;
+}
+
+#[repr(C)]
+struct CreateDiskRaw {
+    partition_style: u32, // 2 = PARTITION_STYLE_RAW
+    data: [u8; 20],
 }
 
 #[repr(C)]
@@ -167,7 +171,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
     let mut drives = Vec::new();
 
     for disk_num in 0..32u32 {
-        // Never allow PhysicalDrive0 or the disk hosting C:\
         if disk_num == 0 || volume_belongs_to_disk('C', disk_num) {
             continue;
         }
@@ -175,7 +178,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let id = format!("PhysicalDrive{}", disk_num);
         let raw_path = PathBuf::from(format!(r"\\.\{}", id));
 
-        // access_mode(0) queries device descriptors directly without requiring Admin privileges
         let Ok(file) = OpenOptions::new()
             .access_mode(0)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -186,10 +188,9 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
 
         let handle = file.as_raw_handle();
 
-        // 1. Query Storage Descriptor (BusType, RemovableMedia, Vendor/Product Model)
         let query = StoragePropertyQuery {
-            property_id: 0, // StorageDeviceProperty
-            query_type: 0,  // PropertyStandardQuery
+            property_id: 0,
+            query_type: 0,
             additional_parameters: [0; 4],
         };
         let mut desc_buf = [0u8; 1024];
@@ -214,7 +215,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let header: StorageDeviceDescriptorHeader =
             unsafe { std::ptr::read_unaligned(desc_buf.as_ptr() as *const _) };
 
-        // Win32 STORAGE_BUS_TYPE: 7 = USB, 12 = SD, 13 = MMC, 14 = Virtual, 15 = FileBackedVirtual, 16 = Spaces
         let is_usb = header.bus_type == 7;
         let is_virtual =
             header.bus_type == 14 || header.bus_type == 15 || header.bus_type == 16;
@@ -223,7 +223,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             continue;
         }
 
-        // 2. Query Exact Disk Capacity via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
         let mut geom: DiskGeometryEx = unsafe { std::mem::zeroed() };
         let ok_geom = unsafe {
             DeviceIoControl(
@@ -307,7 +306,6 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
                     let h = vol_file.as_raw_handle();
                     let _ = ioctl_none(h, FSCTL_LOCK_VOLUME);
                     let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
-                    // Keep handle open so Windows cannot remount the volume during raw write
                     locked.push(vol_file);
                 }
             }
@@ -338,35 +336,41 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
     let handle = file.as_raw_handle();
     let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
     let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
+
+    // Reset partition style to RAW in kernel so even unlettered EFI/Linux partitions unlock
+    let raw_disk = CreateDiskRaw {
+        partition_style: 2, // PARTITION_STYLE_RAW
+        data: [0u8; 20],
+    };
+    let mut returned: u32 = 0;
+    unsafe {
+        let _ = DeviceIoControl(
+            handle,
+            IOCTL_DISK_CREATE_DISK,
+            &raw_disk as *const _ as *const c_void,
+            std::mem::size_of::<CreateDiskRaw>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+    }
     let _ = ioctl_none(handle, IOCTL_DISK_UPDATE_PROPERTIES);
 
     Ok(file)
 }
 
-pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&drive.raw_device_path)
-        .with_context(|| {
-            format!(
-                "Failed to open {} for verification read-back",
-                drive.raw_device_path.display()
-            )
-        })?;
-
-    let handle = file.as_raw_handle();
-    let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
-
-    Ok(file)
+pub fn prepare_for_verify(file: &mut File) -> Result<()> {
+    file.sync_all()
+        .context("Failed to flush Windows hardware buffers")
 }
 
-pub fn flush_and_sync(file: &mut File) -> Result<()> {
-    file.sync_all()
-        .context("Failed to flush Windows hardware buffers")?;
-    let _ = ioctl_none(file.as_raw_handle(), IOCTL_DISK_UPDATE_PROPERTIES);
+pub fn finish_device(file: Option<File>) {
+    if let Some(f) = file {
+        let _ = ioctl_none(f.as_raw_handle(), IOCTL_DISK_UPDATE_PROPERTIES);
+        drop(f);
+    }
     if let Ok(mut locked) = LOCKED_VOLUMES.lock() {
         locked.clear();
     }
-    Ok(())
 }
