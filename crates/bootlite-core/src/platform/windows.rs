@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -179,7 +179,6 @@ fn volume_path_belongs_to_disk(vol_path: &str, target_disk_num: u32) -> bool {
 fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
     let mut paths = Vec::new();
 
-    // 1. Enumerate all system volumes via FindFirstVolumeW / FindNextVolumeW (catches hidden EFI & unlettered partitions)
     let mut buf = [0u16; 260];
     let find_handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
     if find_handle != INVALID_HANDLE_VALUE {
@@ -206,7 +205,6 @@ fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
         }
     }
 
-    // 2. Also include any logical drive letters (A:..Z:) belonging to this disk
     let mask = unsafe { GetLogicalDrives() };
     for i in 0..26u32 {
         if (mask & (1 << i)) != 0 {
@@ -227,7 +225,6 @@ fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
 }
 
 fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
-    // Open read+write first; fall back to read-only if the volume has a read-only ISO9660 filesystem
     let vol_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -256,7 +253,6 @@ fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
         thread::sleep(Duration::from_millis(50));
     }
 
-    // Dismount volume (forcibly severing any open Explorer/Defender handles)
     let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
 
     if !locked {
@@ -268,7 +264,6 @@ fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
         }
     }
 
-    // Keep handle open in LOCKED_VOLUMES so Windows cannot remount the volume mid-write
     out_handles.push(vol_file);
 }
 
@@ -320,11 +315,14 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let header: StorageDeviceDescriptorHeader =
             unsafe { std::ptr::read_unaligned(desc_buf.as_ptr() as *const _) };
 
+        // Win32 STORAGE_BUS_TYPE: 7 = USB, 12 = SD, 13 = MMC, 14..16 = Virtual
         let is_usb = header.bus_type == 7;
+        let is_sd_mmc = header.bus_type == 12 || header.bus_type == 13;
+        let is_removable = header.removable_media != 0;
         let is_virtual =
             header.bus_type == 14 || header.bus_type == 15 || header.bus_type == 16;
 
-        if !is_usb && !(allow_virtual && is_virtual) {
+        if !is_usb && !is_sd_mmc && !is_removable && !(allow_virtual && is_virtual) {
             continue;
         }
 
@@ -349,16 +347,22 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let vendor = extract_cstr(&desc_buf, header.vendor_id_offset);
         let product = extract_cstr(&desc_buf, header.product_id_offset);
         let combined = format!("{} {}", vendor, product).trim().to_string();
-        let model = if combined.is_empty() {
-            "USB Flash Drive".to_string()
-        } else {
+        let model = if !combined.is_empty() {
             combined
+        } else if is_sd_mmc {
+            "SD / MMC Card".to_string()
+        } else {
+            "USB Flash Drive".to_string()
         };
 
         let bus = if is_usb {
             "USB".to_string()
-        } else {
+        } else if is_sd_mmc {
+            "SD/MMC".to_string()
+        } else if is_virtual {
             "VIRTUAL".to_string()
+        } else {
+            "REMOVABLE".to_string()
         };
 
         drives.push(UsbDrive {
@@ -372,6 +376,7 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         });
     }
 
+    drives.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes).then_with(|| a.id.cmp(&b.id)));
     Ok(drives)
 }
 
@@ -380,6 +385,24 @@ fn extract_disk_number(drive: &UsbDrive) -> Option<u32> {
         .id
         .strip_prefix("PhysicalDrive")
         .and_then(|s| s.parse::<u32>().ok())
+}
+
+pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
+    let Some(disk_num) = extract_disk_number(drive) else {
+        return false;
+    };
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let s = abs.to_string_lossy();
+    // Handle both "E:\..." and "\\?\E:\..."
+    let clean = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let mut chars = clean.chars();
+    if let (Some(letter), Some(':')) = (chars.next(), chars.next()) {
+        if letter.is_ascii_alphabetic() {
+            let vol = format!(r"\\.\{}:", letter.to_ascii_uppercase());
+            return volume_path_belongs_to_disk(&vol, disk_num);
+        }
+    }
+    false
 }
 
 pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {

@@ -2,7 +2,7 @@ use crate::UsbDrive;
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
@@ -40,6 +40,7 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let mut bus = String::from("USB");
         let mut size_bytes: u64 = 0;
         let mut is_internal = false;
+        let mut is_removable = false;
 
         for line in info.lines() {
             let trimmed = line.trim();
@@ -58,13 +59,21 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
                 if val.trim().eq_ignore_ascii_case("Yes") {
                     is_internal = true;
                 }
+            } else if let Some(val) = trimmed.strip_prefix("Removable Media:") {
+                let v = val.trim();
+                if v.eq_ignore_ascii_case("Removable") || v.eq_ignore_ascii_case("Yes") {
+                    is_removable = true;
+                }
             }
         }
 
-        if is_internal && !is_disk_image {
+        let is_sd_card = bus.eq_ignore_ascii_case("Secure Digital")
+            || model.to_lowercase().contains("sd card");
+
+        if is_internal && !is_disk_image && !(is_sd_card && is_removable) {
             continue;
         }
-        if bus.eq_ignore_ascii_case("Apple Fabric") {
+        if bus.eq_ignore_ascii_case("Apple Fabric") || size_bytes == 0 {
             continue;
         }
 
@@ -73,13 +82,33 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             id,
             model,
             size_bytes,
-            bus,
+            bus: if is_sd_card { "SDXC".to_string() } else { bus },
             is_system: false,
             is_virtual: is_disk_image,
         });
     }
 
+    drives.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes).then_with(|| a.id.cmp(&b.id)));
     Ok(drives)
+}
+
+pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(out) = Command::new("df").arg(&canonical).output() else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let prefix = format!("/dev/{}", drive.id);
+    for line in stdout.lines().skip(1) {
+        if let Some(dev) = line.split_whitespace().next() {
+            if dev == prefix || dev.starts_with(&format!("{}s", prefix)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {

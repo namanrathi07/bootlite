@@ -1,6 +1,10 @@
 [workspace]
-members = ["crates/bootlite-core", "crates/bootlite-cli", "crates/bootlite-gui"]
 resolver = "2"
+members = [
+    "crates/bootlite-core",
+    "crates/bootlite-cli",
+    "crates/bootlite-gui",
+]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -9,8 +13,9 @@ eframe = "0.29"
 flate2 = "1.0"
 indicatif = "0.17"
 libc = "0.2"
-plist = "1.7"
+lzma-rs = "0.3"
 rfd = "0.15"
+ruzstd = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

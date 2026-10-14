@@ -7,7 +7,6 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Linux ioctl codes (<linux/fs.h>)
 const BLKFLSBUF: libc::c_ulong = 0x1261;
 const BLKRRPART: libc::c_ulong = 0x125f;
 
@@ -90,7 +89,7 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             .unwrap_or_default();
         let is_usb_bus = canonical.contains("/usb");
         let is_removable = read_trimmed(sys_path.join("removable")).as_deref() == Some("1");
-        let is_mmc = name.starts_with("mmcblk") && is_removable;
+        let is_mmc = name.starts_with("mmcblk") && (is_removable || canonical.contains("/mmc"));
 
         let is_usb = is_usb_bus || is_mmc || (is_removable && !is_loop);
         if !is_usb && !(allow_virtual && is_loop) {
@@ -98,12 +97,16 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         }
 
         let vendor = read_trimmed(sys_path.join("device/vendor")).unwrap_or_default();
-        let product = read_trimmed(sys_path.join("device/model")).unwrap_or_default();
+        let product = read_trimmed(sys_path.join("device/model"))
+            .or_else(|| read_trimmed(sys_path.join("device/name")))
+            .unwrap_or_default();
         let combined = format!("{} {}", vendor, product).trim().to_string();
         let model = if !combined.is_empty() {
             combined
         } else if is_loop {
             "Loopback Virtual Disk".to_string()
+        } else if is_mmc {
+            "SD / MMC Card".to_string()
         } else {
             "USB Flash Drive".to_string()
         };
@@ -112,6 +115,8 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             "VIRTUAL".to_string()
         } else if is_usb_bus {
             "USB".to_string()
+        } else if is_mmc {
+            "SD/MMC".to_string()
         } else {
             "REMOVABLE".to_string()
         };
@@ -127,8 +132,32 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         });
     }
 
-    drives.sort_by(|a, b| a.id.cmp(&b.id));
+    drives.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes).then_with(|| a.id.cmp(&b.id)));
     Ok(drives)
+}
+
+pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let path_str = canonical.to_string_lossy();
+    let mounts = get_system_mounted_devs();
+
+    let mut best_dev = None;
+    let mut best_len = 0usize;
+    for (dev, mnt) in &mounts {
+        if path_str.starts_with(mnt.as_str()) && mnt.len() >= best_len {
+            best_len = mnt.len();
+            best_dev = Some(dev.clone());
+        }
+    }
+
+    let prefix = format!("/dev/{}", drive.id);
+    if let Some(dev) = best_dev {
+        dev == prefix || dev.starts_with(&prefix)
+    } else {
+        false
+    }
 }
 
 pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
@@ -156,17 +185,26 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         anyhow::bail!("Safety lock: Refusing to open system disk for writing");
     }
 
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_SYNC | libc::O_CLOEXEC)
+        .custom_flags(libc::O_CLOEXEC)
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {} with O_SYNC (Click 'Unlock Admin Access' first)",
+                "Failed to open {} (Click 'Unlock Admin Access' first)",
                 drive.raw_device_path.display()
             )
-        })
+        })?;
+
+    // Acquire exclusive BSD lock on the block device descriptor.
+    // Per systemd Block Device Locking specification, this inhibits systemd-udevd
+    // and udisks2 from probing or auto-mounting partitions while BootLite is flashing.
+    unsafe {
+        let _ = libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+    }
+
+    Ok(file)
 }
 
 pub fn prepare_for_verify(file: &mut File) -> Result<()> {
@@ -174,7 +212,6 @@ pub fn prepare_for_verify(file: &mut File) -> Result<()> {
         .context("Failed to flush Linux block device buffers")?;
     let fd = file.as_raw_fd();
     unsafe {
-        // Evict Linux kernel page cache so SHA-256 read-back reads physical USB flash sectors
         let _ = libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
         let _ = libc::ioctl(fd, BLKFLSBUF as _, 0);
     }
@@ -183,8 +220,10 @@ pub fn prepare_for_verify(file: &mut File) -> Result<()> {
 
 pub fn finish_device(file: Option<File>) {
     if let Some(f) = file {
+        let fd = f.as_raw_fd();
         unsafe {
-            let _ = libc::ioctl(f.as_raw_fd(), BLKRRPART as _, 0);
+            let _ = libc::flock(fd, libc::LOCK_UN);
+            let _ = libc::ioctl(fd, BLKRRPART as _, 0);
         }
     }
 }
