@@ -1,91 +1,174 @@
 use crate::UsbDrive;
-use anyhow::{bail, Context, Result};
-use std::fs::{self, File};
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-pub fn list_drives(include_virtual: bool) -> Result<Vec<UsbDrive>> {
-    let mut drives = Vec::new();
-    let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+#[derive(Deserialize)]
+struct LsblkOutput {
+    blockdevices: Vec<LsblkDevice>,
+}
 
-    for entry in fs::read_dir("/sys/block").context("Failed to read /sys/block")? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
+#[derive(Deserialize)]
+struct LsblkDevice {
+    name: String,
+    model: Option<String>,
+    size: Option<u64>,
+    rm: Option<bool>,
+    ro: Option<bool>,
+    #[serde(rename = "type")]
+    dev_type: Option<String>,
+    tran: Option<String>,
+    mountpoints: Option<Vec<Option<String>>>,
+    children: Option<Vec<LsblkDevice>>,
+}
 
-        if name.starts_with("ram") || name.starts_with("zram") {
-            continue;
+impl LsblkDevice {
+    fn has_system_mount(&self) -> bool {
+        if let Some(mounts) = &self.mountpoints {
+            for m in mounts.iter().flatten() {
+                if m == "/" || m == "/boot" || m == "/boot/efi" || m == "/home" {
+                    return true;
+                }
+            }
         }
-        let is_loop = name.starts_with("loop");
-        if is_loop && !include_virtual {
-            continue;
+        if let Some(children) = &self.children {
+            for c in children {
+                if c.has_system_mount() {
+                    return true;
+                }
+            }
         }
+        false
+    }
 
-        let sys_path = entry.path();
-        let removable = fs::read_to_string(sys_path.join("removable"))
-            .unwrap_or_default()
-            .trim()
-            == "1";
-
-        let sectors: u64 = fs::read_to_string(sys_path.join("size"))
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        let size_bytes = sectors * 512;
-
-        let model = fs::read_to_string(sys_path.join("device/model"))
-            .unwrap_or_else(|_| "USB/Loop Device".to_string())
-            .trim()
-            .to_string();
-
-        let dev_path = format!("/dev/{}", name);
-        let is_system = mounts.lines().any(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            parts.len() >= 2
-                && parts[0].starts_with(&dev_path)
-                && matches!(parts[1], "/" | "/boot" | "/boot/efi" | "/home")
-        });
-
-        if (removable || (include_virtual && is_loop)) && !is_system && size_bytes > 0 {
-            drives.push(UsbDrive {
-                id: name,
-                raw_device_path: PathBuf::from(dev_path),
-                model,
-                bus: if is_loop {
-                    "Virtual Loop".into()
-                } else {
-                    "USB/Removable".into()
-                },
-                size_bytes,
-                is_system,
-                is_virtual: is_loop,
-            });
+    fn collect_mounted_paths(&self, out: &mut Vec<String>) {
+        if let Some(mounts) = &self.mountpoints {
+            if mounts.iter().flatten().next().is_some() {
+                out.push(format!("/dev/{}", self.name));
+            }
+        }
+        if let Some(children) = &self.children {
+            for c in children {
+                c.collect_mounted_paths(out);
+            }
         }
     }
+}
+
+pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
+    let output = Command::new("lsblk")
+        .args([
+            "-J",
+            "-b",
+            "-o",
+            "NAME,MODEL,SIZE,RM,RO,TYPE,TRAN,MOUNTPOINTS",
+        ])
+        .output()
+        .context("Failed to execute lsblk")?;
+
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("Failed to parse lsblk JSON")?;
+
+    let mut drives = Vec::new();
+    for d in parsed.blockdevices {
+        if d.has_system_mount() || d.ro.unwrap_or(false) {
+            continue;
+        }
+        let dev_type = d.dev_type.as_deref().unwrap_or("");
+        let tran = d.tran.as_deref().unwrap_or("");
+        let is_usb = dev_type == "disk" && (tran.eq_ignore_ascii_case("usb") || d.rm.unwrap_or(false));
+        let is_loop = dev_type == "loop";
+
+        if !is_usb && !(allow_virtual && is_loop) {
+            continue;
+        }
+
+        let raw_path = PathBuf::from(format!("/dev/{}", d.name));
+        drives.push(UsbDrive {
+            id: d.name,
+            model: d
+                .model
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| {
+                    if is_loop {
+                        "Loopback Test Disk".to_string()
+                    } else {
+                        "USB Flash Drive".to_string()
+                    }
+                }),
+            size_bytes: d.size.unwrap_or(0),
+            raw_device_path: raw_path,
+            bus: if is_loop {
+                "VIRTUAL".to_string()
+            } else {
+                tran.to_uppercase()
+            },
+            is_system: false,
+            is_virtual: is_loop,
+        });
+    }
+
     Ok(drives)
 }
 
-pub fn prepare_and_open_raw_device(drive: &UsbDrive) -> Result<File> {
+pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
     if drive.is_system {
-        bail!("SAFETY ABORT: Refusing to open Linux system disk!");
+        anyhow::bail!("Safety lock: Refusing to unmount system drive");
     }
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("umount /dev/{}?* 2>/dev/null || true", drive.id))
-        .status();
 
-    let file = fs::OpenOptions::new()
+    let output = Command::new("lsblk")
+        .args(["-J", "-o", "NAME,MOUNTPOINTS", &drive.raw_device_path.display().to_string()])
+        .output();
+
+    if let Ok(out) = output {
+        if let Ok(parsed) = serde_json::from_slice::<LsblkOutput>(&out.stdout) {
+            let mut to_unmount = Vec::new();
+            for dev in &parsed.blockdevices {
+                dev.collect_mounted_paths(&mut to_unmount);
+            }
+            for part in to_unmount {
+                let _ = Command::new("umount").arg(&part).status();
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
+    if drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to open system disk for writing");
+    }
+
+    OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_SYNC)
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {}. Run with sudo.",
+                "Failed to open {} with O_SYNC (Try running with sudo/pkexec)",
                 drive.raw_device_path.display()
             )
-        })?;
+        })
+}
 
-    Ok(file)
+pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .open(&drive.raw_device_path)
+        .with_context(|| {
+            format!(
+                "Failed to open {} for verification read-back",
+                drive.raw_device_path.display()
+            )
+        })
+}
+
+pub fn flush_and_sync(file: &mut File) -> Result<()> {
+    file.sync_all()
+        .context("Failed to flush Linux block device cache")
 }

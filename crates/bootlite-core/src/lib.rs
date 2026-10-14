@@ -2,6 +2,7 @@ pub mod platform;
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -12,14 +13,15 @@ use std::time::Instant;
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB (256 x 4096-byte sectors)
 const SECTOR_ALIGN: usize = 4096;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDrive {
     pub id: String,
     pub model: String,
     pub size_bytes: u64,
     pub raw_device_path: PathBuf,
-    pub block_device_path: PathBuf,
     pub bus: String,
+    pub is_system: bool,
+    pub is_virtual: bool,
 }
 
 #[derive(Debug, Clone)]

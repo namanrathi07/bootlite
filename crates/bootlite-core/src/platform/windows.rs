@@ -3,18 +3,18 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// Win32 Disk & Volume Control Codes
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
@@ -24,14 +24,14 @@ const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
 #[link(name = "kernel32")]
 extern "system" {
     fn DeviceIoControl(
-        hDevice: RawHandle,
-        dwIoControlCode: u32,
-        lpInBuffer: *const c_void,
-        nInBufferSize: u32,
-        lpOutBuffer: *mut c_void,
-        nOutBufferSize: u32,
-        lpBytesReturned: *mut u32,
-        lpOverlapped: *mut c_void,
+        h_device: RawHandle,
+        dw_io_control_code: u32,
+        lp_in_buffer: *const c_void,
+        n_in_buffer_size: u32,
+        lp_out_buffer: *mut c_void,
+        n_out_buffer_size: u32,
+        lp_bytes_returned: *mut u32,
+        lp_overlapped: *mut c_void,
     ) -> i32;
 }
 
@@ -103,9 +103,10 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             id,
             model: d.friendly_name.unwrap_or_else(|| "USB Storage".to_string()),
             size_bytes: d.size,
-            raw_device_path: raw_path.clone(),
-            block_device_path: raw_path,
+            raw_device_path: raw_path,
             bus,
+            is_system: false,
+            is_virtual,
         });
     }
 
@@ -123,11 +124,11 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
     let Some(disk_num) = extract_disk_number(drive) else {
         anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
     };
-    if disk_num == 0 {
+    if disk_num == 0 || drive.is_system {
         anyhow::bail!("Safety lock: Refusing to clean PhysicalDrive0 (system boot drive)");
     }
 
-    // 1. Ask PowerShell to query any mounted drive letters on this disk so we can lock/dismount them via Win32
+    // 1. Lock & dismount any mounted drive letters on this disk via Win32 FSCTLs
     let query_letters = format!(
         "(Get-Partition -DiskNumber {} -ErrorAction SilentlyContinue | Where-Object DriveLetter | ForEach-Object {{ $_.DriveLetter }})",
         disk_num
@@ -138,8 +139,7 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
         .output()
     {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let letter = line.trim().chars().next();
-            if let Some(ch) = letter {
+            if let Some(ch) = line.trim().chars().next() {
                 if ch.is_ascii_alphabetic() {
                     let vol_path = format!(r"\\.\{}:", ch);
                     if let Ok(vol_file) = OpenOptions::new()
@@ -157,25 +157,29 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
         }
     }
 
-    // 2. Wipe existing partitions on the disk so Windows releases all partition boundary locks
-    let clean_ps = format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; \
-         Set-Disk -Number {0} -IsReadOnly $false; \
-         if ((Get-Disk -Number {0}).PartitionStyle -ne 'RAW') {{ \
-             Clear-Disk -Number {0} -RemoveData -RemoveOEM -Confirm:$false \
-         }}",
-        disk_num
-    );
-    let _ = Command::new("powershell")
+    // 2. Run diskpart clean to strip readonly attributes and destroy any hybrid ISO / EFI / GPT partitions
+    if let Ok(mut child) = Command::new("diskpart")
         .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-Command", &clean_ps])
-        .status();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let script = format!(
+                "select disk {}\r\nattributes disk clear readonly\r\nclean\r\nrescan\r\nexit\r\n",
+                disk_num
+            );
+            let _ = stdin.write_all(script.as_bytes());
+        }
+        let _ = child.wait();
+    }
 
     Ok(())
 }
 
 pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
-    if drive.id == "PhysicalDrive0" {
+    if drive.id == "PhysicalDrive0" || drive.is_system {
         anyhow::bail!("Safety lock: Refusing to open PhysicalDrive0 for writing");
     }
 
@@ -193,7 +197,6 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         })?;
 
     let handle = file.as_raw_handle();
-    // Destroy any kernel-cached partition layout and disable partition boundary checks
     let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
     let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
     let _ = ioctl_none(handle, IOCTL_DISK_UPDATE_PROPERTIES);
@@ -222,7 +225,6 @@ pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
 pub fn flush_and_sync(file: &mut File) -> Result<()> {
     file.sync_all()
         .context("Failed to flush Windows hardware buffers")?;
-    // Notify Windows to re-read the newly flashed partition table after all writes finish
     let _ = ioctl_none(file.as_raw_handle(), IOCTL_DISK_UPDATE_PROPERTIES);
     Ok(())
 }

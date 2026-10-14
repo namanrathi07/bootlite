@@ -1,112 +1,151 @@
 use crate::UsbDrive;
-use anyhow::{bail, Context, Result};
-use serde::Deserialize;
-use std::fs::{self, File};
-use std::os::fd::AsRawFd;
+use anyhow::{Context, Result};
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Deserialize)]
-struct DiskListPlist {
-    #[serde(rename = "WholeDisks", default)]
-    whole_disks: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct DiskInfoPlist {
-    #[serde(rename = "DeviceIdentifier", default)]
-    device_identifier: String,
-    #[serde(rename = "MediaName", default)]
-    media_name: String,
-    #[serde(rename = "BusProtocol", default)]
-    bus_protocol: String,
-    #[serde(rename = "TotalSize", default)]
-    total_size: u64,
-    #[serde(rename = "Internal", default)]
-    internal: bool,
-    #[serde(rename = "Removable", default)]
-    removable: bool,
-    #[serde(rename = "Ejectable", default)]
-    ejectable: bool,
-}
-
-pub fn list_drives(include_virtual: bool) -> Result<Vec<UsbDrive>> {
-    let list_out = Command::new("diskutil")
-        .args(["list", "-plist"])
+pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
+    let output = Command::new("diskutil")
+        .arg("list")
         .output()
         .context("Failed to execute diskutil list")?;
 
-    let parsed: DiskListPlist = plist::from_bytes(&list_out.stdout)
-        .context("Failed to parse diskutil plist")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut candidate_ids = Vec::new();
 
-    let mut drives = Vec::new();
-    for disk_id in parsed.whole_disks {
-        let info_out = Command::new("diskutil")
-            .args(["info", "-plist", &disk_id])
-            .output()?;
-
-        let info: DiskInfoPlist = match plist::from_bytes(&info_out.stdout) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // HARD SAFETY LOCK: Never allow internal drives or Apple Fabric SSD containers
-        if info.internal || info.bus_protocol.eq_ignore_ascii_case("Apple Fabric") {
-            continue;
-        }
-
-        let is_disk_image = info.bus_protocol.eq_ignore_ascii_case("Disk Image");
-        if is_disk_image && !include_virtual {
-            continue;
-        }
-
-        let is_removable = info.removable || info.ejectable;
-        if (is_removable || (include_virtual && is_disk_image)) && info.total_size > 0 {
-            drives.push(UsbDrive {
-                id: info.device_identifier.clone(),
-                raw_device_path: PathBuf::from(format!("/dev/r{}", info.device_identifier)),
-                model: if info.media_name.is_empty() {
-                    "External Drive".into()
-                } else {
-                    info.media_name
-                },
-                bus: info.bus_protocol,
-                size_bytes: info.total_size,
-                is_system: false,
-                is_virtual: is_disk_image,
-            });
+    for line in stdout.lines() {
+        if line.starts_with("/dev/disk") {
+            let is_external = line.contains("external");
+            let is_disk_image = line.contains("disk image");
+            if is_external || (allow_virtual && is_disk_image) {
+                if let Some(dev) = line.split_whitespace().next() {
+                    if let Some(id) = dev.strip_prefix("/dev/") {
+                        candidate_ids.push((id.to_string(), is_disk_image));
+                    }
+                }
+            }
         }
     }
+
+    let mut drives = Vec::new();
+    for (id, is_disk_image) in candidate_ids {
+        let info_out = Command::new("diskutil")
+            .args(["info", &id])
+            .output()
+            .context("Failed to execute diskutil info")?;
+        let info = String::from_utf8_lossy(&info_out.stdout);
+
+        let mut model = String::from("USB Storage");
+        let mut bus = String::from("USB");
+        let mut size_bytes: u64 = 0;
+        let mut is_internal = false;
+
+        for line in info.lines() {
+            let trimmed = line.trim();
+            if let Some(val) = trimmed.strip_prefix("Device / Media Name:") {
+                model = val.trim().to_string();
+            } else if let Some(val) = trimmed.strip_prefix("Protocol:") {
+                bus = val.trim().to_string();
+            } else if let Some(val) = trimmed.strip_prefix("Disk Size:") {
+                if let Some(start) = val.find('(') {
+                    if let Some(end) = val[start + 1..].find(" Bytes") {
+                        let num_str = val[start + 1..start + 1 + end].trim();
+                        size_bytes = num_str.parse::<u64>().unwrap_or(0);
+                    }
+                }
+            } else if let Some(val) = trimmed.strip_prefix("Internal:") {
+                if val.trim().eq_ignore_ascii_case("Yes") {
+                    is_internal = true;
+                }
+            }
+        }
+
+        if is_internal && !is_disk_image {
+            continue;
+        }
+        if bus.eq_ignore_ascii_case("Apple Fabric") {
+            continue;
+        }
+
+        drives.push(UsbDrive {
+            raw_device_path: PathBuf::from(format!("/dev/r{}", id)),
+            id,
+            model,
+            size_bytes,
+            bus,
+            is_system: false,
+            is_virtual: is_disk_image,
+        });
+    }
+
     Ok(drives)
 }
 
-pub fn prepare_and_open_raw_device(drive: &UsbDrive) -> Result<File> {
+pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
     if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
-        bail!("SAFETY ABORT: Refusing to open Apple Fabric internal drive!");
+        anyhow::bail!("Safety lock: Refusing to unmount internal system disk");
     }
 
     let status = Command::new("diskutil")
-        .args(["unmountDisk", &drive.id])
+        .args(["unmountDisk", "force", &format!("/dev/{}", drive.id)])
         .status()
-        .context("Failed to unmount macOS disk")?;
+        .context("Failed to execute diskutil unmountDisk")?;
 
     if !status.success() {
-        bail!("Could not unmount {}. Close any apps using the drive.", drive.id);
+        anyhow::bail!("diskutil failed to unmount /dev/{}", drive.id);
+    }
+    Ok(())
+}
+
+fn enable_nocache(file: &File) -> Result<()> {
+    let fd = file.as_raw_fd();
+    let ret = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        anyhow::bail!(
+            "Failed to enable F_NOCACHE on raw descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
+    if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to open internal system disk for writing");
     }
 
-    let file = fs::OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {}. Run with sudo.",
+                "Failed to open {} for writing (Try unlocking Admin access)",
                 drive.raw_device_path.display()
             )
         })?;
 
-    unsafe {
-        libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
-    }
+    enable_nocache(&file)?;
     Ok(file)
+}
+
+pub fn open_raw_device_read(drive: &UsbDrive) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&drive.raw_device_path)
+        .with_context(|| {
+            format!(
+                "Failed to open {} for verification read-back",
+                drive.raw_device_path.display()
+            )
+        })?;
+
+    enable_nocache(&file)?;
+    Ok(file)
+}
+
+pub fn flush_and_sync(file: &mut File) -> Result<()> {
+    file.sync_all()
+        .context("Failed to flush hardware cache (fsync)")
 }
