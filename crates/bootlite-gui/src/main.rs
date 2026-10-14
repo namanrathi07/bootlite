@@ -31,13 +31,11 @@ fn is_elevated() -> bool {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("net")
-            .arg("session")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        #[link(name = "shell32")]
+        extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() != 0 }
     }
 }
 
@@ -72,15 +70,39 @@ fn relaunch_elevated() -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
         let exe = std::env::current_exe()?;
-        let status = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("Start-Process -FilePath '{}' -Verb RunAs", exe.display()),
-            ])
-            .status()?;
-        if status.success() {
+        let verb: Vec<u16> = std::ffi::OsStr::new("runas")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let file: Vec<u16> = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let res = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if res > 32 {
             std::process::exit(0);
         } else {
             anyhow::bail!("Administrator UAC prompt was cancelled.");
@@ -345,7 +367,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.1.3 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.1.5 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -623,7 +645,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.1.3",
+                                "v0.1.5",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
