@@ -42,14 +42,17 @@ fn relaunch_elevated(image_arg: Option<&PathBuf>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let exe = std::env::current_exe()?;
-        let arg_str = image_arg
-            .map(|p| format!(" \"{}\"", p.display()))
-            .unwrap_or_default();
-        let script = format!(
-            "do shell script \"\\\"{}\\\"{} > /dev/null 2>&1 &\" with administrator privileges",
-            exe.display(),
-            arg_str
-        );
+        let script = match image_arg {
+            Some(img) => format!(
+                "do shell script \"\\\"{}\\\" \\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                exe.display(),
+                img.display()
+            ),
+            None => format!(
+                "do shell script \"\\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                exe.display()
+            ),
+        };
         let status = std::process::Command::new("osascript")
             .args(["-e", &script])
             .status()?;
@@ -397,7 +400,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.1.8 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.1.9 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -677,7 +680,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.1.8",
+                                "v0.1.9",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );

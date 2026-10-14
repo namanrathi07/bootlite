@@ -20,7 +20,6 @@ const IOCTL_DISK_CREATE_DISK: u32 = 0x0007C058;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
-const IOCTL_VOLUME_OFFLINE: u32 = 0x0056C00C;
 const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
 const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
 const FSCTL_ALLOW_EXTENDED_DASD_IO: u32 = 0x00090083;
@@ -180,8 +179,7 @@ fn volume_path_belongs_to_disk(vol_path: &str, target_disk_num: u32) -> bool {
 fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
     let mut paths = Vec::new();
 
-    // 1. Enumerate all system volumes via FindFirstVolumeW / FindNextVolumeW
-    //    This catches hidden EFI partitions and unlettered Linux/ISO partitions!
+    // 1. Enumerate all system volumes via FindFirstVolumeW / FindNextVolumeW (catches hidden EFI & unlettered partitions)
     let mut buf = [0u16; 260];
     let find_handle = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
     if find_handle != INVALID_HANDLE_VALUE {
@@ -229,12 +227,20 @@ fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
 }
 
 fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
-    let Ok(vol_file) = OpenOptions::new()
+    // Open read+write first; fall back to read-only if the volume has a read-only ISO9660 filesystem
+    let vol_file = OpenOptions::new()
         .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(vol_path)
-    else {
+        .or_else(|_| {
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(vol_path)
+        });
+
+    let Ok(vol_file) = vol_file else {
         return;
     };
 
@@ -242,28 +248,27 @@ fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
     let _ = ioctl_none(h, FSCTL_ALLOW_EXTENDED_DASD_IO);
 
     let mut locked = false;
-    for _ in 0..5 {
+    for _ in 0..8 {
         if ioctl_none(h, FSCTL_LOCK_VOLUME) {
             locked = true;
             break;
         }
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(50));
     }
 
-    // Dismount volume; if Explorer/Defender held open handles that blocked FSCTL_LOCK_VOLUME,
-    // FSCTL_DISMOUNT_VOLUME forcibly invalidates those handles so locking now succeeds.
+    // Dismount volume (forcibly severing any open Explorer/Defender handles)
     let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
 
     if !locked {
-        for _ in 0..5 {
+        for _ in 0..8 {
             if ioctl_none(h, FSCTL_LOCK_VOLUME) {
                 break;
             }
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(50));
         }
     }
 
-    let _ = ioctl_none(h, IOCTL_VOLUME_OFFLINE);
+    // Keep handle open in LOCKED_VOLUMES so Windows cannot remount the volume mid-write
     out_handles.push(vol_file);
 }
 
@@ -400,18 +405,36 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         anyhow::bail!("Safety lock: Refusing to open PhysicalDrive0 for writing");
     }
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_WRITE_THROUGH)
-        .open(&drive.raw_device_path)
-        .with_context(|| {
-            format!(
-                "Failed to open {} for raw write (Click 'Unlock Admin Access' first)",
-                drive.raw_device_path.display()
-            )
-        })?;
+    let mut last_err = None;
+    let mut opened_file = None;
+    for _ in 0..5 {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH)
+            .open(&drive.raw_device_path)
+        {
+            Ok(f) => {
+                opened_file = Some(f);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                thread::sleep(Duration::from_millis(80));
+            }
+        }
+    }
+
+    let file = opened_file.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to open {} for raw write ({}): Click 'Unlock Admin Access' first",
+            drive.raw_device_path.display(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Access denied".to_string())
+        )
+    })?;
 
     let handle = file.as_raw_handle();
     let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
