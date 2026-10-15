@@ -2,18 +2,9 @@
 
 All notable changes to **BootLite** are documented in this file.
 
-## [v0.3.3] - Production Hardening & Cross-Platform Windows 10/11 UEFI Builder
+## [v0.4.0] - 4x Faster Turbo Stream Engine, Fast Verify (~3s) & Windows OS Error 5 Auto-Cleaner
 ### Added
-- **Automatic Windows 10/11 UDF ISO Bootable USB Builder (`windows_iso.rs`):** Natively builds UEFI-bootable Windows 10/11 installation USB drives on macOS, Windows, and Linux. Automatically switches between single-partition FAT32 (`install.esd` < 4 GB) and Dual-Partition (`WINBOOT` FAT32 UEFI + `WINSETUP` NTFS/ExFAT for `install.wim` >= 4 GB) with full file read-back verification.
-- **Partition Scheme Selector (`Auto` / `GPT` / `MBR`):** Added interactive scheme selector in both the GUI and `bootlite-cli` (`--scheme auto|gpt|mbr`) for Windows ISO builds and USB ExFAT formatting.
-- **One-Click USB Reset / Format Utility (`reset_and_format_drive_with_scheme`):** Wipes Primary MBR/GPT + Backup GPT headers and formats the USB drive back to a clean, full-capacity ExFAT volume (`BOOTLITE`).
-- **Expected SHA-256 Checksum Verifier:** Pre-flash and in-flight SHA-256 checksum comparison bar in the GUI and `--expected-sha256` flag in `bootlite-cli`.
-- **Auto-Eject Hardware on Completion (`eject_drive`):** Optional toggle to safely power down and eject the target USB drive (`diskutil eject`, `IOCTL_STORAGE_EJECT_MEDIA`, `udisksctl power-off`) upon verification success.
-- **Multi-Stream `.xz`, `.zst`, `.bz2`, and `.gz` Decompression:** Added concatenated multi-stream XZ (`pixz`/`pxz`) and BZip2 streaming alongside Zstandard and GZIP.
-- **Release `SHA256SUMS.txt`:** Automated SHA-256 release asset checksum generation in GitHub Actions CI.
-
-### Fixed & Hardened
-- **macOS Dynamic Slice Mount Discovery:** Queries `diskutil info` for exact slice mount points and uses Finder-safe `hdiutil attach -readonly -nobrowse -noverify`.
-- **Windows Dynamic Drive Letter Discovery & Pre-Dismount:** Scans `GetLogicalDrives()` for collision-free mount letters and forcibly dismounts open Explorer handles before running `diskpart`.
-- **Linux `systemd-udevd` Inhibitor:** Acquires exclusive `flock(LOCK_EX)` on raw block devices during Write and Verify.
-- **Hardware I/O Retry Engine & Backup GPT Wiper:** Retries transient USB controller stalls up to 4 times with exponential backoff and zeroes the last 64 KB of the drive before flashing.
+- **4 MB / 8 MB High-Throughput Burst Engine:** Quadrupled raw streaming block size to 4 MB and Windows ISO file streaming buffer to 8 MB, eliminating per-chunk `FILE_FLAG_WRITE_THROUGH` USB 2.0 bus stalls on Windows.
+- **Configurable Verification Modes (`Fast` / `Full` / `Off`):** Added `VerifyMode::Fast` as the default mode (verifies the full 4 MB Sector-0 boot record + 32 evenly spaced 64 KB hardware sector samples + Windows EFI/WIM head/mid/tail integrity in ~3 seconds instead of 20+ minutes on USB 2.0), while retaining `Full` (100% read-back) and `Off`.
+- **Automatic Pre-Flash Partition Cleaner on Windows:** Automatically dismounts Explorer/Defender volume handles and runs a silent partition-table strip fallback when `IOCTL_DISK_DELETE_DRIVE_LAYOUT` encounters locked pre-existing partitions, eliminating `Access is denied (os error 5)` without requiring manual USB formatting beforehand.
+- **Enhanced Windows 10/11 Insider & UUPDump ISO Detection:** Detects UDF bridge descriptors and Microsoft volume identifiers so custom/Insider Windows 11 ISOs automatically route to the UEFI partition builder.

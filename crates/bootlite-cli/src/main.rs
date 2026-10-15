@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bootlite_core::{
-    eject_drive, flash_and_verify_with_scheme, inspect_image, list_safe_usb_drives,
-    normalize_sha256_input, reset_and_format_drive_with_scheme, PartitionScheme,
+    eject_drive, flash_and_verify_with_options, inspect_image, list_safe_usb_drives,
+    normalize_sha256_input, reset_and_format_drive_with_scheme, PartitionScheme, VerifyMode,
 };
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -16,10 +16,19 @@ fn parse_scheme(s: &str) -> Result<PartitionScheme> {
     }
 }
 
+fn parse_verify(s: &str) -> Result<VerifyMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fast" => Ok(VerifyMode::Fast),
+        "full" => Ok(VerifyMode::Full),
+        "off" | "none" => Ok(VerifyMode::None),
+        other => anyhow::bail!("Invalid verify mode '{}' (use fast, full, or off)", other),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "bootlite-cli",
-    version = "0.3.3",
+    version = "0.4.0",
     about = "Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier"
 )]
 struct Cli {
@@ -47,6 +56,8 @@ enum Commands {
         drive: String,
         #[arg(long, default_value = "auto", help = "Partition scheme: auto, gpt, or mbr")]
         scheme: String,
+        #[arg(long, default_value = "fast", help = "Verification mode: fast, full, or off")]
+        verify: String,
         #[arg(long, help = "Optional expected SHA-256 hash to verify against")]
         expected_sha256: Option<String>,
         #[arg(long, help = "Automatically eject the USB drive after verification")]
@@ -104,17 +115,20 @@ fn main() -> Result<()> {
             image,
             drive,
             scheme,
+            verify,
             expected_sha256,
             eject,
             virtual_disks,
         } => {
             let parsed_scheme = parse_scheme(&scheme)?;
+            let parsed_verify = parse_verify(&verify)?;
             let meta = inspect_image(&image)?;
             println!(
-                "Image Layout: {} ({}) | Scheme: {}",
+                "Image Layout: {} ({}) | Scheme: {} | Verify: {}",
                 meta.scheme,
                 meta.compression,
-                parsed_scheme.label()
+                parsed_scheme.label(),
+                parsed_verify.label()
             );
             if let Some(warn) = &meta.warning {
                 eprintln!("WARNING: {}", warn);
@@ -134,15 +148,21 @@ fn main() -> Result<()> {
                 .progress_chars("#>-"),
             );
 
-            let hash =
-                flash_and_verify_with_scheme(&image, &target, parsed_scheme, None, |prog| {
+            let hash = flash_and_verify_with_options(
+                &image,
+                &target,
+                parsed_scheme,
+                parsed_verify,
+                None,
+                |prog| {
                     pb.set_length(prog.total_bytes);
                     pb.set_position(prog.bytes_processed);
                     pb.set_message(format!("{} ({:.1} MB/s)", prog.phase, prog.speed_mbps));
-                })?;
+                },
+            )?;
             pb.finish_with_message("Verified!");
 
-            println!("Hardware SHA-256: {}", hash);
+            println!("Stream SHA-256: {}", hash);
             if let Some(exp_raw) = expected_sha256 {
                 if let Some(exp) = normalize_sha256_input(&exp_raw) {
                     if exp != hash {

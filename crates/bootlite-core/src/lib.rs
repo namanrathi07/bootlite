@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB (256 x 4096-byte sectors)
+const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB high-throughput burst block size
 const SECTOR_ALIGN: usize = 4096;
 const MAX_IO_RETRIES: usize = 4;
 
@@ -32,6 +32,23 @@ impl PartitionScheme {
             Self::Auto => "Auto (Recommended)",
             Self::Gpt => "GPT (UEFI)",
             Self::Mbr => "MBR (BIOS / UEFI-CSM)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerifyMode {
+    Fast,
+    Full,
+    None,
+}
+
+impl VerifyMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast (Boot + 32 Samples)",
+            Self::Full => "Full (100% Read-Back)",
+            Self::None => "Off (Write Only)",
         }
     }
 }
@@ -92,7 +109,7 @@ impl CompressionKind {
 
     fn label(self) -> &'static str {
         match self {
-            Self::None => "Direct 1 MB Unbuffered Stream",
+            Self::None => "Direct 4 MB Burst Stream",
             Self::Gzip => "On-the-Fly Multi-GZIP Stream",
             Self::Bzip2 => "On-the-Fly BZip2 (.bz2) Stream",
             Self::Xz => "On-the-Fly Multi-Stream XZ / LZMA2",
@@ -211,7 +228,7 @@ pub fn reset_and_format_drive_with_scheme(
         let device = guard.device.as_mut().unwrap();
 
         wipe_stale_backup_gpt(device, drive.size_bytes);
-        let zeros = vec![0u8; CHUNK_SIZE * 2];
+        let zeros = vec![0u8; 2 * 1024 * 1024];
         let _ = device.seek(SeekFrom::Start(0));
         let _ = device.write_all(&zeros);
         let _ = platform::prepare_for_verify(device);
@@ -278,7 +295,7 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
         CompressionKind::Xz => {
             let (tx, rx) = mpsc::sync_channel(8);
             thread::spawn(move || {
-                let mut buf_reader = BufReader::with_capacity(256 * 1024, reader);
+                let mut buf_reader = BufReader::with_capacity(512 * 1024, reader);
                 let mut writer = PipeWriter { tx: tx.clone() };
                 let is_lzma_alone = match buf_reader.fill_buf() {
                     Ok(b) if b.len() >= 6 => &b[0..6] != b"\xFD7zXZ\x00",
@@ -375,21 +392,43 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
     let has_gpt_sig = n >= 520 && &header[512..520] == b"EFI PART";
     let has_apm_sig = n >= 514 && (&header[512..514] == b"PM" || &header[0..2] == b"ER");
 
-    // Check ISO9660 & UDF Volume Descriptors at 0x8001, 0x8801, and 0x9001
     let mut has_iso_or_udf = false;
-    for offset in [0x8001usize, 0x8801usize, 0x9001usize] {
+    let mut has_udf_bridge = false;
+    for offset in [0x8001usize, 0x8801usize, 0x9001usize, 0x9801usize] {
         if n >= offset + 5 {
             let sig = &header[offset..offset + 5];
             if sig == b"CD001" || sig == b"BEA01" || sig == b"NSR02" || sig == b"NSR03" {
                 has_iso_or_udf = true;
-                break;
+            }
+            if sig == b"NSR02" || sig == b"NSR03" || sig == b"BEA01" {
+                has_udf_bridge = true;
             }
         }
     }
 
-    let is_windows_udf_iso = has_iso_or_udf && !has_mbr_sig && kind == CompressionKind::None;
+    let header_ascii = if n >= 0x8400 {
+        String::from_utf8_lossy(&header[0x8000..n]).to_ascii_uppercase()
+    } else {
+        String::new()
+    };
+    let looks_like_windows_pvd = header_ascii.contains("MICROSOFT")
+        || header_ascii.contains("WINDOWS")
+        || header_ascii.contains("CCCOMA")
+        || header_ascii.contains("ESD-ISO")
+        || header_ascii.contains("CDIMAGE")
+        || header_ascii.contains("OSCDIMG");
 
-    let (scheme, warning) = if has_iso_or_udf && has_mbr_sig && has_gpt_sig {
+    let is_windows_udf_iso = kind == CompressionKind::None
+        && has_iso_or_udf
+        && (!has_mbr_sig || has_udf_bridge || looks_like_windows_pvd)
+        && !has_gpt_sig;
+
+    let (scheme, warning) = if is_windows_udf_iso {
+        (
+            "Windows 10/11 UDF Installer (Auto-UEFI Builder)".to_string(),
+            None,
+        )
+    } else if has_iso_or_udf && has_mbr_sig && has_gpt_sig {
         ("ISOHybrid (MBR + GPT + ISO9660)".to_string(), None)
     } else if has_iso_or_udf && has_mbr_sig {
         ("ISOHybrid Bootable Image (MBR + ISO9660)".to_string(), None)
@@ -399,11 +438,6 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
         ("Bootable MBR Disk Image".to_string(), None)
     } else if has_apm_sig {
         ("Apple Partition Map Image".to_string(), None)
-    } else if is_windows_udf_iso {
-        (
-            "Windows 10/11 UDF Installer (Auto-UEFI Builder)".to_string(),
-            None,
-        )
     } else if has_koly_trailer {
         (
             "Compressed Apple UDIF (.dmg) Container".to_string(),
@@ -515,7 +549,7 @@ fn read_chunk_with_retry(
 
 fn wipe_stale_backup_gpt(device: &mut File, drive_size: u64) {
     let wipe_len: u64 = 65536;
-    if drive_size > CHUNK_SIZE as u64 * 4 {
+    if drive_size > CHUNK_SIZE as u64 * 2 {
         let aligned_end = drive_size & !((SECTOR_ALIGN as u64) - 1);
         if aligned_end > wipe_len {
             let tail_offset = aligned_end - wipe_len;
@@ -537,10 +571,11 @@ pub fn flash_and_verify<F>(
 where
     F: FnMut(FlashProgress),
 {
-    flash_and_verify_with_scheme(
+    flash_and_verify_with_options(
         image_path,
         drive,
         PartitionScheme::Auto,
+        VerifyMode::Fast,
         cancel_flag,
         on_progress,
     )
@@ -550,6 +585,27 @@ pub fn flash_and_verify_with_scheme<F>(
     image_path: &Path,
     drive: &UsbDrive,
     scheme: PartitionScheme,
+    cancel_flag: Option<&AtomicBool>,
+    on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    flash_and_verify_with_options(
+        image_path,
+        drive,
+        scheme,
+        VerifyMode::Fast,
+        cancel_flag,
+        on_progress,
+    )
+}
+
+pub fn flash_and_verify_with_options<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    scheme: PartitionScheme,
+    verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -569,6 +625,7 @@ where
                 image_path,
                 drive,
                 scheme,
+                verify_mode,
                 cancel_flag,
                 on_progress,
             );
@@ -616,6 +673,11 @@ where
     let mut deferred_first_chunk: Option<Vec<u8>> = None;
     let mut is_first_chunk = true;
 
+    // For Fast Verify: record up to 32 sample block digests (64 KB each) while streaming
+    let sample_stride: u64 = (file_len / 32).max(CHUNK_SIZE as u64) & !((CHUNK_SIZE as u64) - 1);
+    let mut next_sample_offset: u64 = CHUNK_SIZE as u64;
+    let mut fast_samples: Vec<(u64, usize, [u8; 32])> = Vec::with_capacity(34);
+
     loop {
         if let Some(flag) = cancel_flag {
             if flag.load(Ordering::Relaxed) {
@@ -645,7 +707,20 @@ where
             write_chunk_with_retry(device, 0, &zero_sector_block, cancel_flag)?;
         } else {
             is_first_chunk = false;
-            tail_source_hasher.update(&buf[..n]);
+            if verify_mode == VerifyMode::Full {
+                tail_source_hasher.update(&buf[..n]);
+            } else if verify_mode == VerifyMode::Fast
+                && (total_written >= next_sample_offset || n < CHUNK_SIZE)
+                && fast_samples.len() < 34
+            {
+                let sample_len = n.min(65536) & !(SECTOR_ALIGN - 1);
+                if sample_len >= SECTOR_ALIGN {
+                    let mut sh = Sha256::new();
+                    sh.update(&buf[..sample_len]);
+                    fast_samples.push((total_written, sample_len, sh.finalize().into()));
+                    next_sample_offset = total_written + sample_stride.max(CHUNK_SIZE as u64);
+                }
+            }
 
             let write_len = if n % SECTOR_ALIGN != 0 {
                 let aligned = (n + SECTOR_ALIGN - 1) & !(SECTOR_ALIGN - 1);
@@ -671,7 +746,7 @@ where
         };
 
         on_progress(FlashProgress {
-            phase: "Phase 1/2: Writing raw sectors...",
+            phase: "Phase 1/2: Streaming 4 MB raw blocks...",
             bytes_processed: total_written,
             total_bytes: est_total.max(total_written),
             speed_mbps,
@@ -688,63 +763,102 @@ where
     platform::prepare_for_verify(device)?;
 
     let expected_full_hash = format!("{:x}", full_source_hasher.finalize());
-    let expected_tail_hash = format!("{:x}", tail_source_hasher.finalize());
 
-    let verify_start = Instant::now();
-    let mut tail_verify_hasher = Sha256::new();
-    let mut verified_bytes: u64 = if deferred_first_chunk.is_some() {
-        device
-            .seek(SeekFrom::Start(CHUNK_SIZE as u64))
-            .context("Failed to seek to 1 MB offset for verification")?;
-        CHUNK_SIZE as u64
-    } else {
-        device
-            .seek(SeekFrom::Start(0))
-            .context("Failed to seek to sector 0 for verification")?;
-        0
-    };
-
-    while verified_bytes < total_written {
-        let to_read = ((total_written - verified_bytes) as usize).min(CHUNK_SIZE);
-        let aligned_read = (to_read + SECTOR_ALIGN - 1) & !(SECTOR_ALIGN - 1);
-
-        let n = read_chunk_with_retry(
-            device,
-            verified_bytes,
-            &mut buf[..aligned_read],
-            cancel_flag,
-        )?;
-        if n < to_read {
-            anyhow::bail!(
-                "Unexpected EOF on raw device during verification (read {} of {} bytes)",
-                verified_bytes + (n as u64),
-                total_written
-            );
+    match verify_mode {
+        VerifyMode::None => {}
+        VerifyMode::Fast => {
+            let verify_start = Instant::now();
+            let total_samples = fast_samples.len().max(1) as u64;
+            for (idx, (offset, sample_len, expected_digest)) in fast_samples.iter().enumerate() {
+                device.seek(SeekFrom::Start(*offset))?;
+                let n = read_chunk_with_retry(
+                    device,
+                    *offset,
+                    &mut buf[..*sample_len],
+                    cancel_flag,
+                )?;
+                if n != *sample_len {
+                    anyhow::bail!("Unexpected EOF during Fast Verify at offset {}", offset);
+                }
+                let mut sh = Sha256::new();
+                sh.update(&buf[..*sample_len]);
+                let actual: [u8; 32] = sh.finalize().into();
+                if &actual != expected_digest {
+                    anyhow::bail!(
+                        "Fast Verify SHA-256 mismatch on hardware sector at offset {}",
+                        offset
+                    );
+                }
+                let elapsed = verify_start.elapsed().as_secs_f64().max(0.001);
+                let speed_mbps = (((idx + 1) * *sample_len) as f64 / (1024.0 * 1024.0)) / elapsed;
+                on_progress(FlashProgress {
+                    phase: "Phase 2/2: Fast-Verifying hardware sectors...",
+                    bytes_processed: (idx as u64 + 1) * (total_written / total_samples),
+                    total_bytes: total_written,
+                    speed_mbps,
+                });
+            }
         }
+        VerifyMode::Full => {
+            let expected_tail_hash = format!("{:x}", tail_source_hasher.finalize());
+            let verify_start = Instant::now();
+            let mut tail_verify_hasher = Sha256::new();
+            let mut verified_bytes: u64 = if deferred_first_chunk.is_some() {
+                device
+                    .seek(SeekFrom::Start(CHUNK_SIZE as u64))
+                    .context("Failed to seek to 4 MB offset for verification")?;
+                CHUNK_SIZE as u64
+            } else {
+                device
+                    .seek(SeekFrom::Start(0))
+                    .context("Failed to seek to sector 0 for verification")?;
+                0
+            };
 
-        tail_verify_hasher.update(&buf[..to_read]);
-        verified_bytes += to_read as u64;
+            while verified_bytes < total_written {
+                let to_read = ((total_written - verified_bytes) as usize).min(CHUNK_SIZE);
+                let aligned_read = (to_read + SECTOR_ALIGN - 1) & !(SECTOR_ALIGN - 1);
 
-        let elapsed = verify_start.elapsed().as_secs_f64().max(0.001);
-        let speed_mbps = (verified_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+                let n = read_chunk_with_retry(
+                    device,
+                    verified_bytes,
+                    &mut buf[..aligned_read],
+                    cancel_flag,
+                )?;
+                if n < to_read {
+                    anyhow::bail!(
+                        "Unexpected EOF on raw device during verification (read {} of {} bytes)",
+                        verified_bytes + (n as u64),
+                        total_written
+                    );
+                }
 
-        on_progress(FlashProgress {
-            phase: "Phase 2/2: Verifying SHA-256...",
-            bytes_processed: verified_bytes,
-            total_bytes: total_written,
-            speed_mbps,
-        });
+                tail_verify_hasher.update(&buf[..to_read]);
+                verified_bytes += to_read as u64;
+
+                let elapsed = verify_start.elapsed().as_secs_f64().max(0.001);
+                let speed_mbps = (verified_bytes as f64 / (1024.0 * 1024.0)) / elapsed;
+
+                on_progress(FlashProgress {
+                    phase: "Phase 2/2: Verifying 100% SHA-256 read-back...",
+                    bytes_processed: verified_bytes,
+                    total_bytes: total_written,
+                    speed_mbps,
+                });
+            }
+
+            let actual_tail_hash = format!("{:x}", tail_verify_hasher.finalize());
+            if actual_tail_hash != expected_tail_hash {
+                anyhow::bail!(
+                    "SHA-256 verification mismatch on data sectors! Expected: {}, Actual: {}",
+                    expected_tail_hash,
+                    actual_tail_hash
+                );
+            }
+        }
     }
 
-    let actual_tail_hash = format!("{:x}", tail_verify_hasher.finalize());
-    if actual_tail_hash != expected_tail_hash {
-        anyhow::bail!(
-            "SHA-256 verification mismatch on data sectors! Expected: {}, Actual: {}",
-            expected_tail_hash,
-            actual_tail_hash
-        );
-    }
-
+    // Commit and verify the 4 MB boot record at Sector 0 last
     if let Some(first_chunk) = deferred_first_chunk {
         device
             .seek(SeekFrom::Start(0))

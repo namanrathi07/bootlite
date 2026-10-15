@@ -12,7 +12,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -229,8 +228,8 @@ fn enumerate_disk_volume_paths(target_disk_num: u32) -> Vec<String> {
     paths
 }
 
-fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
-    let vol_file = OpenOptions::new()
+fn open_volume_rw(vol_path: &str) -> Option<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -240,9 +239,12 @@ fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
                 .read(true)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .open(vol_path)
-        });
+        })
+        .ok()
+}
 
-    let Ok(vol_file) = vol_file else {
+fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
+    let Some(vol_file) = open_volume_rw(vol_path) else {
         return;
     };
 
@@ -250,26 +252,35 @@ fn lock_and_dismount_volume(vol_path: &str, out_handles: &mut Vec<File>) {
     let _ = ioctl_none(h, FSCTL_ALLOW_EXTENDED_DASD_IO);
 
     let mut locked = false;
-    for _ in 0..8 {
+    for _ in 0..6 {
         if ioctl_none(h, FSCTL_LOCK_VOLUME) {
             locked = true;
             break;
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(40));
     }
 
+    // Always dismount (forcibly severs open Explorer / Defender / Indexer handles)
     let _ = ioctl_none(h, FSCTL_DISMOUNT_VOLUME);
 
     if !locked {
-        for _ in 0..8 {
-            if ioctl_none(h, FSCTL_LOCK_VOLUME) {
-                break;
+        // Re-open fresh handle after dismount and acquire exclusive lock
+        drop(vol_file);
+        if let Some(fresh_file) = open_volume_rw(vol_path) {
+            let fh = fresh_file.as_raw_handle();
+            let _ = ioctl_none(fh, FSCTL_ALLOW_EXTENDED_DASD_IO);
+            for _ in 0..6 {
+                if ioctl_none(fh, FSCTL_LOCK_VOLUME) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
             }
-            thread::sleep(Duration::from_millis(50));
+            let _ = ioctl_none(fh, FSCTL_DISMOUNT_VOLUME);
+            out_handles.push(fresh_file);
         }
+    } else {
+        out_handles.push(vol_file);
     }
-
-    out_handles.push(vol_file);
 }
 
 pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
@@ -427,18 +438,24 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
 }
 
 pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
-    if drive.id == "PhysicalDrive0" || drive.is_system {
+    let Some(disk_num) = extract_disk_number(drive) else {
+        anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
+    };
+    if disk_num == 0 || drive.is_system {
         anyhow::bail!("Safety lock: Refusing to open PhysicalDrive0 for writing");
     }
 
     let mut last_err = None;
     let mut opened_file = None;
-    for _ in 0..5 {
+
+    // Notice: We do NOT pass FILE_FLAG_WRITE_THROUGH here because synchronous SCSI FUA
+    // writes per chunk cripple USB 2.0 write throughput down to ~3 MB/s.
+    // Instead, we stream 4 MB bursts and call FlushFileBuffers in prepare_for_verify().
+    for _ in 0..6 {
         match OpenOptions::new()
             .read(true)
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_WRITE_THROUGH)
             .open(&drive.raw_device_path)
         {
             Ok(f) => {
@@ -447,7 +464,7 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
             }
             Err(e) => {
                 last_err = Some(e);
-                thread::sleep(Duration::from_millis(80));
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -464,7 +481,7 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
 
     let handle = file.as_raw_handle();
     let _ = ioctl_none(handle, FSCTL_ALLOW_EXTENDED_DASD_IO);
-    let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
+    let layout_deleted = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
 
     let raw_disk = CreateDiskRaw {
         partition_style: 2,
@@ -484,6 +501,43 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         );
     }
     let _ = ioctl_none(handle, IOCTL_DISK_UPDATE_PROPERTIES);
+
+    // If Windows kernel refused IOCTL_DISK_DELETE_DRIVE_LAYOUT due to a stubborn pre-existing
+    // partition, run a silent 1-second diskpart clean so "Access is denied (os error 5)" never occurs.
+    if !layout_deleted {
+        drop(file);
+        if let Ok(mut locked) = LOCKED_VOLUMES.lock() {
+            locked.clear();
+        }
+        if let Ok(mut dp) = Command::new("diskpart")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = dp.stdin.take() {
+                let script = format!(
+                    "select disk {}\r\nattributes disk clear readonly\r\nclean\r\nexit\r\n",
+                    disk_num
+                );
+                let _ = stdin.write_all(script.as_bytes());
+            }
+            let _ = dp.wait();
+        }
+        let _ = unmount_drive(drive);
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&drive.raw_device_path)
+            .context("Failed to reopen PhysicalDrive after partition clean")?;
+        let _ = ioctl_none(reopened.as_raw_handle(), FSCTL_ALLOW_EXTENDED_DASD_IO);
+        return Ok(reopened);
+    }
+
+    // Re-lock any remaining volume handles after layout deletion
+    let _ = unmount_drive(drive);
 
     Ok(file)
 }

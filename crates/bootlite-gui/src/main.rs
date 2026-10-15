@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use bootlite_core::{flash_and_verify_with_scheme, PartitionScheme,
+use bootlite_core::{flash_and_verify_with_options, PartitionScheme, VerifyMode,
     compute_image_sha256, eject_drive, inspect_image, is_image_on_drive,
     list_safe_usb_drives, normalize_sha256_input, reset_and_format_drive_with_scheme, windows_iso::WIN_ISO_OVERHEAD_BYTES, ImageMetadata, UsbDrive,
 };
@@ -467,6 +467,7 @@ struct BootLiteApp {
     allow_virtual: bool,
     auto_eject: bool,
     partition_scheme: PartitionScheme,
+    verify_mode: VerifyMode,
     show_confirm_modal: bool,
     show_reset_modal: bool,
     show_exit_modal: bool,
@@ -484,7 +485,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.3.3 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.4.0 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -505,6 +506,7 @@ impl BootLiteApp {
             allow_virtual: false,
             auto_eject: false,
             partition_scheme: PartitionScheme::Auto,
+            verify_mode: VerifyMode::Fast,
             show_confirm_modal: false,
             show_reset_modal: false,
             show_exit_modal: false,
@@ -781,6 +783,7 @@ impl BootLiteApp {
         let expected_opt = normalize_sha256_input(&self.expected_sha256);
         let should_eject = self.auto_eject;
         let scheme = self.partition_scheme;
+        let vmode = self.verify_mode;
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let cancel_clone = Arc::clone(&self.cancel_flag);
@@ -829,7 +832,7 @@ impl BootLiteApp {
             let mut last_phase = String::new();
             let mut last_logged_bucket: u64 = 0;
 
-            let result = flash_and_verify_with_scheme(&image_path, &drive, scheme, Some(&cancel_clone), |prog| {
+            let result = flash_and_verify_with_options(&image_path, &drive, scheme, vmode, Some(&cancel_clone), |prog| {
                 let fraction = if prog.total_bytes > 0 {
                     (prog.bytes_processed as f32 / prog.total_bytes as f32).clamp(0.0, 1.0)
                 } else {
@@ -1002,7 +1005,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.3.3",
+                                "v0.4.0",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -1563,6 +1566,34 @@ impl eframe::App for BootLiteApp {
                                 .rounding(5.0);
                                 if ui.add(btn).clicked() {
                                     self.partition_scheme = s;
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Verify:")
+                                    .size(11.5)
+                                    .color(TEXT_SUB),
+                            );
+                            for (vm, vlbl) in [
+                                (VerifyMode::Fast, "Fast"),
+                                (VerifyMode::Full, "Full"),
+                                (VerifyMode::None, "Off"),
+                            ] {
+                                let active = self.verify_mode == vm;
+                                let btn = egui::Button::new(
+                                    RichText::new(vlbl)
+                                        .size(11.0)
+                                        .strong()
+                                        .color(if active { Color32::WHITE } else { TEXT_SUB }),
+                                )
+                                .fill(if active {
+                                    ACCENT_SUCCESS
+                                } else {
+                                    Color32::from_rgb(30, 41, 59)
+                                })
+                                .rounding(5.0);
+                                if ui.add(btn).clicked() {
+                                    self.verify_mode = vm;
                                 }
                             }
 

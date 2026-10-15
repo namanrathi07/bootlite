@@ -1,14 +1,14 @@
-use crate::{compute_image_sha256, FlashProgress, PartitionScheme, UsbDrive};
+use crate::{FlashProgress, PartitionScheme, UsbDrive, VerifyMode};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-const COPY_CHUNK: usize = 1024 * 1024; // 1 MB
+const COPY_CHUNK: usize = 8 * 1024 * 1024; // 8 MB high-throughput streaming buffer
 const FAT32_MAX_FILE_SIZE: u64 = 4_000_000_000; // Safe threshold (~3.72 GiB) for FAT32
 pub const WIN_ISO_OVERHEAD_BYTES: u64 = 700_000_000; // ~700 MB overhead for UEFI boot partition
 
@@ -46,7 +46,10 @@ fn is_uefi_boot_file(rel_lower: &str) -> bool {
 fn copy_and_hash_file<F>(
     src: &Path,
     dst: &Path,
+    file_len: u64,
     cancel_flag: Option<&AtomicBool>,
+    buf: &mut [u8],
+    stream_hasher: &mut Sha256,
     bytes_done: &mut u64,
     total_bytes: u64,
     start_time: Instant,
@@ -64,20 +67,20 @@ where
     let mut writer = File::create(dst)
         .with_context(|| format!("Failed to create USB file: {}", dst.display()))?;
 
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut file_hasher = Sha256::new();
     loop {
         if let Some(flag) = cancel_flag {
             if flag.load(Ordering::Relaxed) {
                 anyhow::bail!("Windows ISO build cancelled by user");
             }
         }
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(buf)?;
         if n == 0 {
             break;
         }
         writer.write_all(&buf[..n])?;
-        hasher.update(&buf[..n]);
+        file_hasher.update(&buf[..n]);
+        stream_hasher.update(&buf[..n]);
         *bytes_done += n as u64;
 
         let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
@@ -89,14 +92,20 @@ where
             speed_mbps,
         });
     }
-    writer.sync_all()?;
-    Ok(hasher.finalize().into())
+
+    // Only force per-file hardware sync on large WIM/ESD archives (> 64 MB) to avoid
+    // stalling the USB controller 1,100 times on tiny .dll / .mui files.
+    if file_len >= 64 * 1024 * 1024 {
+        writer.sync_all()?;
+    }
+    Ok(file_hasher.finalize().into())
 }
 
 fn verify_usb_file_readback<F>(
     usb_file: &Path,
     expected_digest: &[u8; 32],
     cancel_flag: Option<&AtomicBool>,
+    buf: &mut [u8],
     bytes_verified: &mut u64,
     total_verify_bytes: u64,
     start_time: Instant,
@@ -112,7 +121,6 @@ where
         )
     })?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; COPY_CHUNK];
 
     loop {
         if let Some(flag) = cancel_flag {
@@ -120,7 +128,7 @@ where
                 anyhow::bail!("Verification cancelled by user");
             }
         }
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(buf)?;
         if n == 0 {
             break;
         }
@@ -147,13 +155,66 @@ where
     Ok(())
 }
 
+fn fast_verify_spot_check(src_file: &Path, usb_file: &Path, file_len: u64) -> Result<()> {
+    let meta = fs::metadata(usb_file).with_context(|| {
+        format!(
+            "Missing written file on USB drive: {}",
+            usb_file.display()
+        )
+    })?;
+    if meta.len() != file_len {
+        anyhow::bail!(
+            "File size mismatch on USB for {} (expected {}, got {})",
+            usb_file.display(),
+            file_len,
+            meta.len()
+        );
+    }
+    if file_len == 0 {
+        return Ok(());
+    }
+
+    let sample_size: usize = 512 * 1024; // 512 KB spot check at head, middle, and tail
+    let mut src = File::open(src_file)?;
+    let mut dst = File::open(usb_file)?;
+    let mut b1 = vec![0u8; sample_size];
+    let mut b2 = vec![0u8; sample_size];
+
+    let offsets = if file_len <= (sample_size as u64) * 2 {
+        vec![0u64]
+    } else {
+        vec![
+            0u64,
+            file_len / 2,
+            file_len.saturating_sub(sample_size as u64),
+        ]
+    };
+
+    for off in offsets {
+        src.seek(SeekFrom::Start(off))?;
+        dst.seek(SeekFrom::Start(off))?;
+        let to_read = ((file_len - off) as usize).min(sample_size);
+        src.read_exact(&mut b1[..to_read])?;
+        dst.read_exact(&mut b2[..to_read])?;
+        if b1[..to_read] != b2[..to_read] {
+            anyhow::bail!(
+                "Spot-check verification mismatch in {} at offset {}",
+                usb_file.display(),
+                off
+            );
+        }
+    }
+    Ok(())
+}
+
 fn copy_and_verify_windows_tree<F>(
     iso_root: &Path,
     efi_mount: Option<&Path>,
     data_mount: &Path,
+    verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
     on_progress: &mut F,
-) -> Result<()>
+) -> Result<String>
 where
     F: FnMut(FlashProgress),
 {
@@ -163,28 +224,37 @@ where
         anyhow::bail!("Mounted Windows ISO appears empty or unreadable");
     }
 
+    let is_dual = efi_mount.is_some();
     let mut total_write_bytes: u64 = 0;
     for (p, len) in &all_files {
-        total_write_bytes += *len;
-        if efi_mount.is_some() {
-            let rel = p
-                .strip_prefix(iso_root)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
+        let rel = p
+            .strip_prefix(iso_root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if is_dual {
             if is_uefi_boot_file(&rel) {
                 total_write_bytes += *len;
             }
+            // In Dual-Partition mode, sources/boot.wim (600 MB) is already on WINBOOT (FAT32).
+            // Skipping duplicate copy to WINSETUP saves 600 MB of slow USB writing!
+            if rel != "sources/boot.wim" {
+                total_write_bytes += *len;
+            }
+        } else {
+            total_write_bytes += *len;
         }
     }
 
-    let mut written_targets: Vec<(PathBuf, [u8; 32])> = Vec::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut stream_hasher = Sha256::new();
+    let mut written_targets: Vec<(PathBuf, PathBuf, u64, [u8; 32])> = Vec::new();
     let mut bytes_done: u64 = 0;
     let write_start = Instant::now();
 
     if let Some(efi_dir) = efi_mount {
-        for (src_path, _) in &all_files {
+        for (src_path, file_len) in &all_files {
             let rel_path = src_path.strip_prefix(iso_root).unwrap_or(src_path);
             let rel_lower = rel_path
                 .to_string_lossy()
@@ -196,49 +266,95 @@ where
                 let digest = copy_and_hash_file(
                     src_path,
                     &dst_efi,
+                    *file_len,
                     cancel_flag,
+                    &mut buf,
+                    &mut stream_hasher,
                     &mut bytes_done,
                     total_write_bytes,
                     write_start,
                     "Phase 1/2: Writing UEFI FAT32 Bootloader (boot.wim)...",
                     on_progress,
                 )?;
-                written_targets.push((dst_efi, digest));
+                written_targets.push((src_path.clone(), dst_efi, *file_len, digest));
             }
         }
     }
 
-    for (src_path, _) in &all_files {
+    for (src_path, file_len) in &all_files {
         let rel_path = src_path.strip_prefix(iso_root).unwrap_or(src_path);
+        let rel_lower = rel_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+
+        if is_dual && rel_lower == "sources/boot.wim" {
+            continue;
+        }
+
         let dst_data = data_mount.join(rel_path);
         let digest = copy_and_hash_file(
             src_path,
             &dst_data,
+            *file_len,
             cancel_flag,
+            &mut buf,
+            &mut stream_hasher,
             &mut bytes_done,
             total_write_bytes,
             write_start,
             "Phase 1/2: Streaming Windows Setup & install.wim to USB...",
             on_progress,
         )?;
-        written_targets.push((dst_data, digest));
+        written_targets.push((src_path.clone(), dst_data, *file_len, digest));
     }
 
-    let mut bytes_verified: u64 = 0;
-    let verify_start = Instant::now();
-    for (usb_path, expected_digest) in &written_targets {
-        verify_usb_file_readback(
-            usb_path,
-            expected_digest,
-            cancel_flag,
-            &mut bytes_verified,
-            total_write_bytes,
-            verify_start,
-            on_progress,
-        )?;
+    match verify_mode {
+        VerifyMode::None => {}
+        VerifyMode::Fast => {
+            on_progress(FlashProgress {
+                phase: "Phase 2/2: Fast-Verifying Windows Bootloaders & WIM integrity...",
+                bytes_processed: total_write_bytes,
+                total_bytes: total_write_bytes,
+                speed_mbps: 0.0,
+            });
+            for (src_path, usb_path, file_len, _) in &written_targets {
+                let rel_lower = src_path
+                    .strip_prefix(iso_root)
+                    .unwrap_or(src_path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                if *file_len >= 16 * 1024 * 1024
+                    || rel_lower.ends_with(".efi")
+                    || rel_lower == "bootmgr"
+                    || rel_lower == "setup.exe"
+                    || rel_lower == "boot/bcd"
+                    || rel_lower == "efi/microsoft/boot/bcd"
+                {
+                    fast_verify_spot_check(src_path, usb_path, *file_len)?;
+                }
+            }
+        }
+        VerifyMode::Full => {
+            let mut bytes_verified: u64 = 0;
+            let verify_start = Instant::now();
+            for (_, usb_path, _, expected_digest) in &written_targets {
+                verify_usb_file_readback(
+                    usb_path,
+                    expected_digest,
+                    cancel_flag,
+                    &mut buf,
+                    &mut bytes_verified,
+                    total_write_bytes,
+                    verify_start,
+                    on_progress,
+                )?;
+            }
+        }
     }
 
-    Ok(())
+    Ok(format!("{:x}", stream_hasher.finalize()))
 }
 
 #[cfg(target_os = "macos")]
@@ -265,6 +381,7 @@ pub fn flash_windows_iso_to_usb<F>(
     image_path: &Path,
     drive: &UsbDrive,
     _scheme: PartitionScheme,
+    verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -284,8 +401,6 @@ where
         );
     }
 
-    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
-
     on_progress(FlashProgress {
         phase: "Windows ISO: Mounting UDF optical image...",
         bytes_processed: 0,
@@ -293,7 +408,6 @@ where
         speed_mbps: 0.0,
     });
 
-    // Attach via hdiutil without forcing a fixed mountpoint (succeeds even if Finder already mounted it)
     let attach_out = Command::new("hdiutil")
         .args([
             "attach",
@@ -346,7 +460,7 @@ where
     let needs_dual = has_large_wim_file(&iso_mount)?;
     let disk_node = format!("/dev/{}", drive.id);
 
-    if needs_dual {
+    let stream_hash = if needs_dual {
         on_progress(FlashProgress {
             phase: "Windows ISO: Formatting USB (FAT32 UEFI + ExFAT Setup)...",
             bytes_processed: 5,
@@ -384,9 +498,10 @@ where
             &iso_mount,
             Some(&efi_mount),
             &data_mount,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
+        )?
     } else {
         on_progress(FlashProgress {
             phase: "Windows ISO: Formatting USB as Single FAT32 (WINSETUP)...",
@@ -412,17 +527,18 @@ where
             &iso_mount,
             None,
             &data_mount,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
-    }
+        )?
+    };
 
     let _ = Command::new("sync").status();
     let _ = Command::new("diskutil")
         .args(["unmountDisk", &disk_node])
         .status();
 
-    Ok(iso_hash)
+    Ok(stream_hash)
 }
 
 #[cfg(target_os = "windows")]
@@ -451,6 +567,7 @@ pub fn flash_windows_iso_to_usb<F>(
     image_path: &Path,
     drive: &UsbDrive,
     scheme: PartitionScheme,
+    verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -480,8 +597,6 @@ where
             iso_size
         );
     }
-
-    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
 
     // Forcibly dismount any open Explorer handles on the USB drive, then release locks for diskpart
     let _ = crate::platform::unmount_drive(drive);
@@ -533,7 +648,7 @@ where
         ""
     };
 
-    if needs_dual {
+    let stream_hash = if needs_dual {
         on_progress(FlashProgress {
             phase: "Windows ISO: Partitioning USB (FAT32 UEFI + NTFS Setup)...",
             bytes_processed: 0,
@@ -579,9 +694,10 @@ where
             &iso_root,
             Some(&efi_mount),
             &data_mount,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
+        )?
     } else {
         on_progress(FlashProgress {
             phase: "Windows ISO: Formatting USB as FAT32 (WINSETUP)...",
@@ -629,12 +745,13 @@ where
             &iso_root,
             None,
             &data_mount,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
-    }
+        )?
+    };
 
-    Ok(iso_hash)
+    Ok(stream_hash)
 }
 
 #[cfg(target_os = "linux")]
@@ -642,6 +759,7 @@ pub fn flash_windows_iso_to_usb<F>(
     image_path: &Path,
     drive: &UsbDrive,
     scheme: PartitionScheme,
+    verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -660,8 +778,6 @@ where
             iso_size
         );
     }
-
-    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
 
     crate::platform::unmount_drive(drive)?;
 
@@ -711,7 +827,7 @@ where
         speed_mbps: 0.0,
     });
 
-    if needs_dual {
+    let stream_hash = if needs_dual {
         let status = Command::new("parted")
             .args([
                 "-s",
@@ -790,9 +906,10 @@ where
             &iso_mnt,
             Some(&efi_mnt),
             &data_mnt,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
+        )?
     } else {
         let status = Command::new("parted")
             .args([
@@ -841,10 +958,11 @@ where
             &iso_mnt,
             None,
             &data_mnt,
+            verify_mode,
             cancel_flag,
             &mut on_progress,
-        )?;
-    }
+        )?
+    };
 
-    Ok(iso_hash)
+    Ok(stream_hash)
 }

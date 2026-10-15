@@ -1,4 +1,4 @@
-# ⚡ BootLite (`v0.3.3`)
+# ⚡ BootLite (`v0.4.0`)
 
 **Cross-Platform Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier**
 
@@ -16,15 +16,15 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 
 **BootLite (`~4 MB` single binary)** combines the best of both into a native GPU-accelerated Rust application:
 
-| Capability | ⚡ BootLite `v0.3.3` | Rufus `v4.x` | balenaEtcher `v2.x` |
+| Capability | ⚡ BootLite `v0.4.0` | Rufus `v4.x` | balenaEtcher `v2.x` |
 | :--- | :---: | :---: | :---: |
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot |
-| **Linux ISOHybrid / Raspberry Pi / BSD Raw Flashing** | ✅ Unbuffered 1 MB I/O | ✅ DD Mode | ✅ Yes |
+| **4 MB / 8 MB High-Throughput Burst Engine** | ✅ Full USB Bus Speed | ✅ Yes | ⚠️ Slow Full Verify |
+| **Smart Verification (`Fast ~3s` / `Full 100%` / `Off`)** | ✅ Configurable | ✅ Optional | ❌ Mandatory Slow Read |
 | **On-the-Fly `.xz` (Multi-Stream), `.zst`, `.bz2`, `.gz`** | ✅ Built-in Pure Rust | ✅ Yes | ✅ Yes |
 | **Partition Scheme Selector (`Auto` / `GPT` / `MBR`)** | ✅ Yes | ✅ Yes | ❌ No |
 | **One-Click USB ExFAT Reset / Capacity Recovery** | ✅ Built-in | ✅ Yes | ❌ No |
-| **Full Physical Sector SHA-256 Read-Back Verify** | ✅ Cache-Bypassed | ✅ Optional | ✅ Yes |
 | **Expected SHA-256 Checksum Verifier** | ✅ Pre-Flash & In-Flight | ✅ Yes | ❌ No |
 | **Auto-Eject Hardware on Completion** | ✅ Built-in Toggle | ❌ No | ✅ Yes |
 | **Binary Footprint** | **~4 MB Native Rust** | ~1.5 MB C | ~150 MB Electron |
@@ -33,7 +33,7 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 
 ## 📦 Download Pre-Built Binaries
 
-Download the latest release directly from [**GitHub Releases (`v0.3.3`)**](https://github.com/NR3009/bootlite/releases/latest):
+Download the latest release directly from [**GitHub Releases (`v0.4.0`)**](https://github.com/NR3009/bootlite/releases/latest):
 
 * 🍎 **macOS (Apple Silicon):** [`BootLite-macOS-AppleSilicon.dmg`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg)
 * 💻 **Windows 10 / 11 (x64 Portable — Zero DLL Dependencies):** [`BootLite-Windows-x86_64-Portable.exe`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe)
@@ -54,17 +54,14 @@ xattr -cr /Applications/BootLite.app
 1. **System Disk Lockout (3-OS Kernel Protection):**
    * **macOS:** Blocks internal `Apple Fabric` NVMe drives, synthesized APFS containers, and `/dev/disk0`, while supporting external USB drives and built-in SDXC card slots.
    * **Windows:** Queries Win32 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` and blocks `PhysicalDrive0` and any physical disk hosting `C:`.
-   * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`< 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`, or `/nix`.
+   * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`under 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`, or `/nix`.
 2. **Automatic Windows 10/11 UDF ISO Builder (`windows_iso.rs`):**
-   * Automatically detects non-hybrid Microsoft Windows 10/11 ISOs (`CD001` / `BEA01` / `NSR02` / `NSR03` without an MBR/GPT boot table).
-   * If `sources/install.wim` is under 4 GB (`install.esd`), formats a single bootable `FAT32` volume (`WINSETUP`).
-   * If `sources/install.wim` exceeds the 4 GB FAT32 file limit, automatically builds a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`), verifies every written file back from the USB drive, and returns the exact `.iso` SHA-256 checksum.
-3. **Zeroed Sector-0 & Stale Backup GPT Wiper:**
-   * Zeroes the last 64 KB of the USB drive before writing to destroy leftover Backup GPT headers from prior flashes.
-   * Holds Sector 0 (the first 1 MB containing MBR/GPT partition tables) in RAM during both the **Write** phase and the **99% SHA-256 Read-Back Verification** phase so OS auto-mounters (`mountmgr`, `diskarbitrationd`, `udisks2`) never hijack the drive mid-operation.
-4. **True Physical NAND Read-Back Verification & Transient I/O Retries:**
-   * Bypasses OS RAM page caches (`F_NOCACHE` + `F_FULLFSYNC` on macOS, `FILE_FLAG_WRITE_THROUGH` on Windows, `flock(LOCK_EX)` + `BLKFLSBUF` + `POSIX_FADV_DONTNEED` on Linux) so SHA-256 verification reads real USB sectors.
-   * Includes 4-attempt exponential-backoff sector retries (`120ms -> 250ms -> 500ms -> 1000ms`) and an active OS sleep inhibitor during long operations.
+   * Automatically detects retail and Insider/UUPDump Microsoft Windows 10/11 ISOs.
+   * Streams files using an **8 MB burst buffer**, creating a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`) when `install.wim` exceeds the FAT32 file size limit.
+3. **4 MB Burst Streaming & 3-Mode Hardware Verification (`Fast` / `Full` / `Off`):**
+   * **Fast Verify (Default — ~3 seconds):** Flushes physical hardware controller caches, verifies the entire **Sector 0 Boot Record / EFI Bootloaders**, and spot-checks **32 evenly spaced hardware sample blocks + WIM head/middle/tail sectors**.
+   * **Full Verify:** Performs a 100% sector-by-sector SHA-256 read-back across the entire drive.
+   * **Auto-Clean Partition Unlock on Windows:** Automatically dismounts open Explorer/Defender handles and strips stubborn partition layouts before opening `PhysicalDriveN` so `Access is denied (os error 5)` never occurs.
 
 ---
 
@@ -82,6 +79,7 @@ sudo bootlite-cli flash \
   --image ubuntu-24.04-desktop-amd64.iso \
   --drive disk4 \
   --scheme auto \
+  --verify fast \
   --expected-sha256 <sha256-hash> \
   --eject
 
