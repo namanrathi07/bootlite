@@ -21,7 +21,7 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot |
 | **4 MB / 8 MB High-Throughput Burst Engine** | ✅ Full USB Bus Speed | ✅ Yes | ⚠️ Slow Full Verify |
-| **Smart Verification (`Fast ~3s` / `Full 100%` / `Off`)** | ✅ Configurable | ✅ Optional | ❌ Mandatory Slow Read |
+| **Smart Verification (`Fast ~3s` / `Full 100%` / `Off`)** | ✅ 3 Selectable Modes | ✅ Optional | ❌ Mandatory Slow Read |
 | **On-the-Fly `.xz` (Multi-Stream), `.zst`, `.bz2`, `.gz`** | ✅ Built-in Pure Rust | ✅ Yes | ✅ Yes |
 | **Partition Scheme Selector (`Auto` / `GPT` / `MBR`)** | ✅ Yes | ✅ Yes | ❌ No |
 | **One-Click USB ExFAT Reset / Capacity Recovery** | ✅ Built-in | ✅ Yes | ❌ No |
@@ -49,6 +49,27 @@ xattr -cr /Applications/BootLite.app
 
 ---
 
+## 🔍 Verification Modes (`Fast` vs `Full` vs `Off`) & Partition Schemes
+
+### 1. Verification Selector (`Verify:`)
+Reading back a 9 GB OS image byte-by-byte over a USB 2.0 port can add 15–20 minutes to a flash job. BootLite lets you choose how hardware verification is performed:
+
+* **`Fast (~3s)` (Default — Recommended):**
+  * Flushes the physical USB hardware controller cache (`F_FULLFSYNC` / `FlushFileBuffers` / `BLKFLSBUF`).
+  * **For Linux / Raw Images:** Verifies **100% of the 4 MB Sector-0 Boot Record (MBR/GPT)** + **32 evenly spaced 64 KB cryptographic sample blocks** across the drive (including the tail sectors to catch counterfeit/fake-capacity USB sticks).
+  * **For Windows 10/11 ISOs:** Verifies all critical UEFI bootloaders (`bootx64.efi`, `bootmgr`, `BCD`, `setup.exe`) and spot-checks **512 KB Head, Middle, and Tail slices** of `sources/boot.wim` and `sources/install.wim`.
+* **`Full (100%)`:**
+  * Reads back **every single written sector/file (100% of the image)** from physical USB NAND flash and verifies its SHA-256 digest against the source stream. Best for testing older or suspect USB drives.
+* **`Off`:**
+  * Flushes hardware caches, commits the boot record, and completes immediately after writing.
+
+### 2. Partition Scheme Selector (`Scheme:`)
+* **`Auto` (Default):** Preserves built-in `ISOHybrid` (`MBR + GPT`) tables on Linux/BSD images and automatically picks the optimal UEFI partition table when building a Windows 10/11 USB.
+* **`GPT`:** Forces a **GUID Partition Table** layout for modern UEFI systems when building a Windows USB or formatting a drive via **Reset / Format USB**.
+* **`MBR`:** Forces a **Master Boot Record (BIOS / UEFI-CSM)** layout for legacy motherboards or dual BIOS/UEFI boot compatibility.
+
+---
+
 ## 🛡️ Architecture & Hardware Safety Guarantees
 
 1. **System Disk Lockout (3-OS Kernel Protection):**
@@ -57,11 +78,9 @@ xattr -cr /Applications/BootLite.app
    * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`under 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`, or `/nix`.
 2. **Automatic Windows 10/11 UDF ISO Builder (`windows_iso.rs`):**
    * Automatically detects retail and Insider/UUPDump Microsoft Windows 10/11 ISOs.
-   * Streams files using an **8 MB burst buffer**, creating a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`) when `install.wim` exceeds the FAT32 file size limit.
-3. **4 MB Burst Streaming & 3-Mode Hardware Verification (`Fast` / `Full` / `Off`):**
-   * **Fast Verify (Default — ~3 seconds):** Flushes physical hardware controller caches, verifies the entire **Sector 0 Boot Record / EFI Bootloaders**, and spot-checks **32 evenly spaced hardware sample blocks + WIM head/middle/tail sectors**.
-   * **Full Verify:** Performs a 100% sector-by-sector SHA-256 read-back across the entire drive.
-   * **Auto-Clean Partition Unlock on Windows:** Automatically dismounts open Explorer/Defender handles and strips stubborn partition layouts before opening `PhysicalDriveN` so `Access is denied (os error 5)` never occurs.
+   * Streams files using an **8 MB burst buffer**, creating a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`) when `install.wim` exceeds the 4 GB FAT32 file limit.
+3. **Auto-Clean Partition Unlock on Windows (Zero `os error 5`):**
+   * Automatically dismounts open Explorer/Defender handles, re-locks volumes, and strips stubborn pre-existing partition layouts before opening `PhysicalDriveN` so `Access is denied (os error 5)` never occurs.
 
 ---
 
@@ -74,7 +93,7 @@ bootlite-cli list
 # 2. Inspect any image or compressed archive (.iso, .img.xz, .iso.zst, .bz2, .dmg)
 bootlite-cli inspect --image Win11_24H2_English_x64.iso
 
-# 3. Flash & hardware-verify any Linux, Raspberry Pi, or Windows 10/11 image
+# 3. Flash & verify (choose --verify fast, full, or off; --scheme auto, gpt, or mbr)
 sudo bootlite-cli flash \
   --image ubuntu-24.04-desktop-amd64.iso \
   --drive disk4 \
