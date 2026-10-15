@@ -25,6 +25,7 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 | **One-Click USB ExFAT Reset / Capacity Recovery** | ✅ Built-in | ✅ Yes | ❌ No |
 | **Full Physical Sector SHA-256 Read-Back Verify** | ✅ Cache-Bypassed | ✅ Optional | ✅ Yes |
 | **Expected SHA-256 Checksum Verifier** | ✅ Pre-Flash & In-Flight | ✅ Yes | ❌ No |
+| **Auto-Eject Hardware on Completion** | ✅ Built-in Toggle | ❌ No | ✅ Yes |
 | **Binary Footprint** | **~4 MB Native Rust** | ~1.5 MB C | ~150 MB Electron |
 
 ---
@@ -36,6 +37,7 @@ Download the latest release directly from [**GitHub Releases (`v0.3.3`)**](https
 * 🍎 **macOS (Apple Silicon):** [`BootLite-macOS-AppleSilicon.dmg`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg)
 * 💻 **Windows 10 / 11 (x64 Portable — Zero DLL Dependencies):** [`BootLite-Windows-x86_64-Portable.exe`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe)
 * 🐧 **Linux (x86_64 Tarball — GUI + CLI):** [`BootLite-Linux-x86_64.tar.gz`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Linux-x86_64.tar.gz)
+* 🔐 **Release Checksums:** [`SHA256SUMS.txt`](https://github.com/NR3009/bootlite/releases/latest/download/SHA256SUMS.txt)
 
 ### 🍎 macOS First-Launch Note
 Because `BootLite.app` is open-source and not signed with a paid Apple Developer ID certificate, macOS Gatekeeper may show a prompt on first launch. Run this once after dragging `BootLite.app` to `/Applications`:
@@ -49,17 +51,19 @@ xattr -cr /Applications/BootLite.app
 ## 🛡️ Architecture & Hardware Safety Guarantees
 
 1. **System Disk Lockout (3-OS Kernel Protection):**
-   * **macOS:** Blocks internal `Apple Fabric` NVMe drives, synthesized APFS containers, and `/dev/disk0`.
+   * **macOS:** Blocks internal `Apple Fabric` NVMe drives, synthesized APFS containers, and `/dev/disk0`, while supporting external USB drives and built-in SDXC card slots.
    * **Windows:** Queries Win32 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` and blocks `PhysicalDrive0` and any physical disk hosting `C:`.
-   * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`< 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, or `/var`.
+   * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`< 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`, or `/nix`.
 2. **Automatic Windows 10/11 UDF ISO Builder (`windows_iso.rs`):**
-   * Detects non-hybrid Microsoft Windows 10/11 ISOs automatically.
-   * If `sources/install.wim` exceeds the 4 GB FAT32 file limit, BootLite creates a **Dual-Partition UEFI + Data layout** (`WINBOOT` FAT32 for UEFI `boot.wim` + `WINSETUP` NTFS/ExFAT for `install.wim`) and verifies every written file back from the USB drive.
+   * Automatically detects non-hybrid Microsoft Windows 10/11 ISOs (`CD001` / `BEA01` / `NSR02` / `NSR03` without an MBR/GPT boot table).
+   * If `sources/install.wim` is under 4 GB (`install.esd`), formats a single bootable `FAT32` volume (`WINSETUP`).
+   * If `sources/install.wim` exceeds the 4 GB FAT32 file limit, automatically builds a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`), verifies every written file back from the USB drive, and returns the exact `.iso` SHA-256 checksum.
 3. **Zeroed Sector-0 & Stale Backup GPT Wiper:**
    * Zeroes the last 64 KB of the USB drive before writing to destroy leftover Backup GPT headers from prior flashes.
    * Holds Sector 0 (the first 1 MB containing MBR/GPT partition tables) in RAM during both the **Write** phase and the **99% SHA-256 Read-Back Verification** phase so OS auto-mounters (`mountmgr`, `diskarbitrationd`, `udisks2`) never hijack the drive mid-operation.
-4. **True Physical NAND Read-Back Verification:**
+4. **True Physical NAND Read-Back Verification & Transient I/O Retries:**
    * Bypasses OS RAM page caches (`F_NOCACHE` + `F_FULLFSYNC` on macOS, `FILE_FLAG_WRITE_THROUGH` on Windows, `flock(LOCK_EX)` + `BLKFLSBUF` + `POSIX_FADV_DONTNEED` on Linux) so SHA-256 verification reads real USB sectors.
+   * Includes 4-attempt exponential-backoff sector retries (`120ms -> 250ms -> 500ms -> 1000ms`) and an active OS sleep inhibitor during long operations.
 
 ---
 
@@ -69,18 +73,19 @@ xattr -cr /Applications/BootLite.app
 # 1. List connected external USB & SD drives
 bootlite-cli list
 
-# 2. Inspect any image or compressed archive (.iso, .img.xz, .iso.zst, .dmg)
-bootlite-cli inspect --image ubuntu-24.04-desktop-amd64.iso
+# 2. Inspect any image or compressed archive (.iso, .img.xz, .iso.zst, .bz2, .dmg)
+bootlite-cli inspect --image Win11_24H2_English_x64.iso
 
-# 3. Flash & hardware-verify an image (with optional SHA-256 check and auto-eject)
+# 3. Flash & hardware-verify any Linux, Raspberry Pi, or Windows 10/11 image
 sudo bootlite-cli flash \
   --image ubuntu-24.04-desktop-amd64.iso \
   --drive disk4 \
+  --scheme auto \
   --expected-sha256 <sha256-hash> \
   --eject
 
 # 4. Wipe partition tables & restore a USB stick to full-capacity ExFAT
-sudo bootlite-cli reset --drive disk4 --label BOOTLITE
+sudo bootlite-cli reset --drive disk4 --label BOOTLITE --scheme auto
 ```
 
 ---
