@@ -1,6 +1,7 @@
 # ⚡ BootLite (`v0.3.3`)
 
-**Cross-Platform Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier**  
+**Cross-Platform Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier**
+
 *Built in 100% Native Rust (`bootlite-core`, `bootlite-gui`, `bootlite-cli`) for macOS, Windows, and Linux.*
 
 [![Release](https://img.shields.io/github/v/release/NR3009/bootlite?style=flat-square&color=blue)](https://github.com/NR3009/bootlite/releases/latest)
