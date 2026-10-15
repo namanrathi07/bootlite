@@ -28,7 +28,7 @@ fn parse_verify(s: &str) -> Result<VerifyMode> {
 #[derive(Parser)]
 #[command(
     name = "bootlite-cli",
-    version = "0.4.0",
+    version = "0.4.1",
     about = "Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier"
 )]
 struct Cli {

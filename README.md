@@ -1,4 +1,4 @@
-# ⚡ BootLite (`v0.4.0`)
+# ⚡ BootLite (`v0.4.1`)
 
 **Cross-Platform Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier**
 
@@ -16,7 +16,7 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 
 **BootLite (`~4 MB` single binary)** combines the best of both into a native GPU-accelerated Rust application:
 
-| Capability | ⚡ BootLite `v0.4.0` | Rufus `v4.x` | balenaEtcher `v2.x` |
+| Capability | ⚡ BootLite `v0.4.1` | Rufus `v4.x` | balenaEtcher `v2.x` |
 | :--- | :---: | :---: | :---: |
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot |
@@ -33,7 +33,7 @@ Most USB flashers force you to choose: **Rufus** works great on Windows (includi
 
 ## 📦 Download Pre-Built Binaries
 
-Download the latest release directly from [**GitHub Releases (`v0.4.0`)**](https://github.com/NR3009/bootlite/releases/latest):
+Download the latest release directly from [**GitHub Releases (`v0.4.1`)**](https://github.com/NR3009/bootlite/releases/latest):
 
 * 🍎 **macOS (Apple Silicon):** [`BootLite-macOS-AppleSilicon.dmg`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg)
 * 💻 **Windows 10 / 11 (x64 Portable — Zero DLL Dependencies):** [`BootLite-Windows-x86_64-Portable.exe`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe)
