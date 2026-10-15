@@ -1,0 +1,791 @@
+use crate::{compute_image_sha256, FlashProgress, UsbDrive};
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+const COPY_CHUNK: usize = 1024 * 1024; // 1 MB
+const FAT32_MAX_FILE_SIZE: u64 = 4_000_000_000; // Safe threshold (~3.72 GiB) for FAT32
+
+fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, u64)>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            collect_files(&path, out)?;
+        } else if meta.is_file() {
+            out.push((path, meta.len()));
+        }
+    }
+    Ok(())
+}
+
+fn has_large_wim_file(iso_root: &Path) -> Result<bool> {
+    let mut files = Vec::new();
+    collect_files(iso_root, &mut files)?;
+    Ok(files.iter().any(|(_, len)| *len >= FAT32_MAX_FILE_SIZE))
+}
+
+/// Only UEFI bootloaders and WinPE (sources/boot.wim) belong on WINBOOT.
+/// Excluding root setup.exe ensures WinPE automatically locates sources/install.wim on WINSETUP.
+fn is_uefi_boot_file(rel_lower: &str) -> bool {
+    rel_lower == "bootmgr"
+        || rel_lower == "bootmgr.efi"
+        || rel_lower.starts_with("boot/")
+        || rel_lower.starts_with("efi/")
+        || rel_lower == "sources/boot.wim"
+}
+
+fn copy_and_hash_file<F>(
+    src: &Path,
+    dst: &Path,
+    cancel_flag: Option<&AtomicBool>,
+    bytes_done: &mut u64,
+    total_bytes: u64,
+    start_time: Instant,
+    label: &str,
+    on_progress: &mut F,
+) -> Result<[u8; 32]>
+where
+    F: FnMut(FlashProgress),
+{
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut reader = File::open(src)
+        .with_context(|| format!("Failed to open ISO source file: {}", src.display()))?;
+    let mut writer = File::create(dst)
+        .with_context(|| format!("Failed to create USB file: {}", dst.display()))?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    loop {
+        if let Some(flag) = cancel_flag {
+            if flag.load(Ordering::Relaxed) {
+                anyhow::bail!("Windows ISO build cancelled by user");
+            }
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        *bytes_done += n as u64;
+
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let speed_mbps = (*bytes_done as f64 / (1024.0 * 1024.0)) / elapsed;
+        on_progress(FlashProgress {
+            phase: label,
+            bytes_processed: *bytes_done,
+            total_bytes: total_bytes.max(*bytes_done),
+            speed_mbps,
+        });
+    }
+    writer.sync_all()?;
+    Ok(hasher.finalize().into())
+}
+
+fn verify_usb_file_readback<F>(
+    usb_file: &Path,
+    expected_digest: &[u8; 32],
+    cancel_flag: Option<&AtomicBool>,
+    bytes_verified: &mut u64,
+    total_verify_bytes: u64,
+    start_time: Instant,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(FlashProgress),
+{
+    let mut reader = File::open(usb_file).with_context(|| {
+        format!(
+            "Failed to open USB file for verification: {}",
+            usb_file.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+
+    loop {
+        if let Some(flag) = cancel_flag {
+            if flag.load(Ordering::Relaxed) {
+                anyhow::bail!("Verification cancelled by user");
+            }
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        *bytes_verified += n as u64;
+
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let speed_mbps = (*bytes_verified as f64 / (1024.0 * 1024.0)) / elapsed;
+        on_progress(FlashProgress {
+            phase: "Phase 2/2: Verifying written Windows USB files...",
+            bytes_processed: *bytes_verified,
+            total_bytes: total_verify_bytes.max(*bytes_verified),
+            speed_mbps,
+        });
+    }
+
+    let actual: [u8; 32] = hasher.finalize().into();
+    if &actual != expected_digest {
+        anyhow::bail!(
+            "SHA-256 read-back verification failed for USB file: {}",
+            usb_file.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_and_verify_windows_tree<F>(
+    iso_root: &Path,
+    efi_mount: Option<&Path>,
+    data_mount: &Path,
+    cancel_flag: Option<&AtomicBool>,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(FlashProgress),
+{
+    let mut all_files = Vec::new();
+    collect_files(iso_root, &mut all_files)?;
+    if all_files.is_empty() {
+        anyhow::bail!("Mounted Windows ISO appears empty or unreadable");
+    }
+
+    let mut total_write_bytes: u64 = 0;
+    for (p, len) in &all_files {
+        total_write_bytes += *len;
+        if efi_mount.is_some() {
+            let rel = p
+                .strip_prefix(iso_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            if is_uefi_boot_file(&rel) {
+                total_write_bytes += *len;
+            }
+        }
+    }
+
+    let mut written_targets: Vec<(PathBuf, [u8; 32])> = Vec::new();
+    let mut bytes_done: u64 = 0;
+    let write_start = Instant::now();
+
+    if let Some(efi_dir) = efi_mount {
+        for (src_path, _) in &all_files {
+            let rel_path = src_path.strip_prefix(iso_root).unwrap_or(src_path);
+            let rel_lower = rel_path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+
+            if is_uefi_boot_file(&rel_lower) {
+                let dst_efi = efi_dir.join(rel_path);
+                let digest = copy_and_hash_file(
+                    src_path,
+                    &dst_efi,
+                    cancel_flag,
+                    &mut bytes_done,
+                    total_write_bytes,
+                    write_start,
+                    "Phase 1/2: Writing UEFI FAT32 Bootloader (boot.wim)...",
+                    on_progress,
+                )?;
+                written_targets.push((dst_efi, digest));
+            }
+        }
+    }
+
+    for (src_path, _) in &all_files {
+        let rel_path = src_path.strip_prefix(iso_root).unwrap_or(src_path);
+        let dst_data = data_mount.join(rel_path);
+        let digest = copy_and_hash_file(
+            src_path,
+            &dst_data,
+            cancel_flag,
+            &mut bytes_done,
+            total_write_bytes,
+            write_start,
+            "Phase 1/2: Streaming Windows Setup & install.wim to USB...",
+            on_progress,
+        )?;
+        written_targets.push((dst_data, digest));
+    }
+
+    let mut bytes_verified: u64 = 0;
+    let verify_start = Instant::now();
+    for (usb_path, expected_digest) in &written_targets {
+        verify_usb_file_readback(
+            usb_path,
+            expected_digest,
+            cancel_flag,
+            &mut bytes_verified,
+            total_write_bytes,
+            verify_start,
+            on_progress,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn flash_windows_iso_to_usb<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    cancel_flag: Option<&AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to format internal system disk");
+    }
+
+    let iso_size = fs::metadata(image_path)?.len();
+    if drive.size_bytes < iso_size + 1_200_000_000 {
+        anyhow::bail!(
+            "Target USB drive ({} bytes) is too small for Windows Setup ISO ({} bytes + 1.2 GB boot overhead)",
+            drive.size_bytes,
+            iso_size
+        );
+    }
+
+    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
+
+    on_progress(FlashProgress {
+        phase: "Windows ISO: Mounting UDF optical image...",
+        bytes_processed: 0,
+        total_bytes: 100,
+        speed_mbps: 0.0,
+    });
+
+    let iso_mount = PathBuf::from(format!("/tmp/bootlite_win_iso_{}", std::process::id()));
+    let _ = fs::create_dir_all(&iso_mount);
+
+    let attach_status = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-readonly",
+            "-nobrowse",
+            "-mountpoint",
+            &iso_mount.to_string_lossy(),
+            &image_path.to_string_lossy(),
+        ])
+        .status()
+        .context("Failed to mount Windows ISO via hdiutil")?;
+
+    if !attach_status.success() {
+        anyhow::bail!("hdiutil failed to mount Windows ISO image");
+    }
+
+    struct IsoUnmountGuard(PathBuf);
+    impl Drop for IsoUnmountGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-force", &self.0.to_string_lossy()])
+                .status();
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _iso_guard = IsoUnmountGuard(iso_mount.clone());
+
+    let needs_dual = has_large_wim_file(&iso_mount)?;
+    let disk_node = format!("/dev/{}", drive.id);
+
+    if needs_dual {
+        on_progress(FlashProgress {
+            phase: "Windows ISO: Formatting USB (MBR: FAT32 UEFI + ExFAT Setup)...",
+            bytes_processed: 5,
+            total_bytes: 100,
+            speed_mbps: 0.0,
+        });
+
+        let part_status = Command::new("diskutil")
+            .args([
+                "partitionDisk",
+                &disk_node,
+                "MBRFormat",
+                "MS-DOS",
+                "WINBOOT",
+                "1024M",
+                "ExFAT",
+                "WINSETUP",
+                "R",
+            ])
+            .status()
+            .context("Failed to partition USB drive for Windows Setup")?;
+
+        if !part_status.success() {
+            anyhow::bail!("diskutil partitionDisk failed while creating Windows UEFI layout");
+        }
+
+        let efi_mount = PathBuf::from("/Volumes/WINBOOT");
+        let data_mount = PathBuf::from("/Volumes/WINSETUP");
+
+        for _ in 0..15 {
+            if efi_mount.exists() && data_mount.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        if !efi_mount.exists() || !data_mount.exists() {
+            anyhow::bail!(
+                "Mounted partitions /Volumes/WINBOOT and /Volumes/WINSETUP were not found"
+            );
+        }
+
+        copy_and_verify_windows_tree(
+            &iso_mount,
+            Some(&efi_mount),
+            &data_mount,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    } else {
+        on_progress(FlashProgress {
+            phase: "Windows ISO: Formatting USB as Single FAT32 (WINSETUP)...",
+            bytes_processed: 5,
+            total_bytes: 100,
+            speed_mbps: 0.0,
+        });
+
+        let part_status = Command::new("diskutil")
+            .args(["eraseDisk", "MS-DOS", "WINSETUP", "MBRFormat", &disk_node])
+            .status()
+            .context("Failed to format USB drive as FAT32")?;
+
+        if !part_status.success() {
+            anyhow::bail!("diskutil eraseDisk failed while creating FAT32 layout");
+        }
+
+        let data_mount = PathBuf::from("/Volumes/WINSETUP");
+        for _ in 0..15 {
+            if data_mount.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        copy_and_verify_windows_tree(
+            &iso_mount,
+            None,
+            &data_mount,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    }
+
+    let _ = Command::new("sync").status();
+    let _ = Command::new("diskutil")
+        .args(["unmountDisk", &disk_node])
+        .status();
+
+    Ok(iso_hash)
+}
+
+#[cfg(target_os = "windows")]
+fn find_two_free_drive_letters() -> Result<(char, char)> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
+    let mut free = Vec::new();
+    for i in (3..26u32).rev() {
+        if (mask & (1 << i)) == 0 {
+            free.push((b'A' + (i as u8)) as char);
+            if free.len() == 2 {
+                return Ok((free[0], free[1]));
+            }
+        }
+    }
+    anyhow::bail!(
+        "No two free drive letters (D:..Z:) available on Windows to mount USB partitions"
+    )
+}
+
+#[cfg(target_os = "windows")]
+pub fn flash_windows_iso_to_usb<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    cancel_flag: Option<&AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let Some(disk_num) = drive
+        .id
+        .strip_prefix("PhysicalDrive")
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        anyhow::bail!("Invalid Windows PhysicalDrive ID: {}", drive.id);
+    };
+    if disk_num == 0 || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to format PhysicalDrive0");
+    }
+
+    let iso_size = fs::metadata(image_path)?.len();
+    if drive.size_bytes < iso_size + 1_200_000_000 {
+        anyhow::bail!(
+            "Target USB drive ({} bytes) is too small for Windows Setup ISO ({} bytes + 1.2 GB boot overhead)",
+            drive.size_bytes,
+            iso_size
+        );
+    }
+
+    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
+
+    crate::platform::finish_device(None);
+
+    let iso_str = image_path.to_string_lossy().replace('\'', "''");
+    let mount_ps = format!(
+        "$img = Mount-DiskImage -ImagePath '{}' -PassThru; ($img | Get-Volume).DriveLetter",
+        iso_str
+    );
+    let out = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", &mount_ps])
+        .output()
+        .context("Failed to mount Windows ISO")?;
+
+    let iso_letter = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .chars()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Failed to obtain mounted Windows ISO drive letter"))?;
+
+    struct WinIsoGuard(String);
+    impl Drop for WinIsoGuard {
+        fn drop(&mut self) {
+            let cmd = format!(
+                "Dismount-DiskImage -ImagePath '{}' -ErrorAction SilentlyContinue",
+                self.0
+            );
+            let _ = Command::new("powershell")
+                .creation_flags(0x08000000)
+                .args(["-NoProfile", "-Command", &cmd])
+                .status();
+        }
+    }
+    let _guard = WinIsoGuard(iso_str);
+
+    let iso_root = PathBuf::from(format!(r"{}:\", iso_letter));
+    let needs_dual = has_large_wim_file(&iso_root)?;
+    let (efi_letter, data_letter) = find_two_free_drive_letters()?;
+
+    if needs_dual {
+        on_progress(FlashProgress {
+            phase: "Windows ISO: Partitioning USB (FAT32 UEFI + NTFS Setup)...",
+            bytes_processed: 0,
+            total_bytes: 100,
+            speed_mbps: 0.0,
+        });
+
+        let mut dp = Command::new("diskpart")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to start diskpart for Windows USB creation")?;
+
+        if let Some(mut stdin) = dp.stdin.take() {
+            let script = format!(
+                "select disk {}\r\n\
+                 attributes disk clear readonly\r\n\
+                 clean\r\n\
+                 convert gpt\r\n\
+                 create partition primary size=1024\r\n\
+                 format fs=fat32 label=\"WINBOOT\" quick\r\n\
+                 assign letter={}\r\n\
+                 create partition primary\r\n\
+                 format fs=ntfs label=\"WINSETUP\" quick\r\n\
+                 assign letter={}\r\n\
+                 exit\r\n",
+                disk_num, efi_letter, data_letter
+            );
+            let _ = stdin.write_all(script.as_bytes());
+        }
+        let status = dp.wait()?;
+        if !status.success() {
+            anyhow::bail!("diskpart failed to create FAT32 + NTFS Windows boot layout");
+        }
+
+        let efi_mount = PathBuf::from(format!(r"{}:\", efi_letter));
+        let data_mount = PathBuf::from(format!(r"{}:\", data_letter));
+
+        copy_and_verify_windows_tree(
+            &iso_root,
+            Some(&efi_mount),
+            &data_mount,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    } else {
+        on_progress(FlashProgress {
+            phase: "Windows ISO: Formatting USB as FAT32 (WINSETUP)...",
+            bytes_processed: 0,
+            total_bytes: 100,
+            speed_mbps: 0.0,
+        });
+
+        let mut dp = Command::new("diskpart")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to start diskpart for FAT32 Windows USB creation")?;
+
+        if let Some(mut stdin) = dp.stdin.take() {
+            let script = format!(
+                "select disk {}\r\n\
+                 attributes disk clear readonly\r\n\
+                 clean\r\n\
+                 convert gpt\r\n\
+                 create partition primary size=32000\r\n\
+                 format fs=fat32 label=\"WINSETUP\" quick\r\n\
+                 assign letter={}\r\n\
+                 exit\r\n",
+                disk_num, data_letter
+            );
+            let _ = stdin.write_all(script.as_bytes());
+        }
+        let status = dp.wait()?;
+        if !status.success() {
+            anyhow::bail!("diskpart failed to create FAT32 Windows boot layout");
+        }
+
+        let data_mount = PathBuf::from(format!(r"{}:\", data_letter));
+        copy_and_verify_windows_tree(
+            &iso_root,
+            None,
+            &data_mount,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    }
+
+    Ok(iso_hash)
+}
+
+#[cfg(target_os = "linux")]
+pub fn flash_windows_iso_to_usb<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    cancel_flag: Option<&AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    if drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to format system disk");
+    }
+
+    let iso_size = fs::metadata(image_path)?.len();
+    if drive.size_bytes < iso_size + 1_200_000_000 {
+        anyhow::bail!(
+            "Target USB drive ({} bytes) is too small for Windows Setup ISO ({} bytes + 1.2 GB boot overhead)",
+            drive.size_bytes,
+            iso_size
+        );
+    }
+
+    let iso_hash = compute_image_sha256(image_path, cancel_flag, &mut on_progress)?;
+
+    crate::platform::unmount_drive(drive)?;
+
+    let pid = std::process::id();
+    let iso_mnt = PathBuf::from(format!("/tmp/bootlite_iso_{}", pid));
+    let efi_mnt = PathBuf::from(format!("/tmp/bootlite_efi_{}", pid));
+    let data_mnt = PathBuf::from(format!("/tmp/bootlite_data_{}", pid));
+    let _ = fs::create_dir_all(&iso_mnt);
+    let _ = fs::create_dir_all(&efi_mnt);
+    let _ = fs::create_dir_all(&data_mnt);
+
+    struct LinuxMountGuard(Vec<PathBuf>);
+    impl Drop for LinuxMountGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("sync").status();
+            for m in &self.0 {
+                let _ = Command::new("umount").arg(m).status();
+                let _ = fs::remove_dir_all(m);
+            }
+        }
+    }
+    let _guard = LinuxMountGuard(vec![iso_mnt.clone(), efi_mnt.clone(), data_mnt.clone()]);
+
+    let m1 = Command::new("mount")
+        .args([
+            "-o",
+            "loop,ro",
+            &image_path.to_string_lossy(),
+            &iso_mnt.to_string_lossy(),
+        ])
+        .status()
+        .context("Failed to loop-mount Windows ISO on Linux")?;
+    if !m1.success() {
+        anyhow::bail!("Failed to mount Windows ISO image via loop device");
+    }
+
+    let needs_dual = has_large_wim_file(&iso_mnt)?;
+    let dev = format!("/dev/{}", drive.id);
+
+    on_progress(FlashProgress {
+        phase: "Windows ISO: Partitioning USB (MBR: FAT32 EFI + NTFS/ExFAT)...",
+        bytes_processed: 0,
+        total_bytes: 100,
+        speed_mbps: 0.0,
+    });
+
+    if needs_dual {
+        let status = Command::new("parted")
+            .args([
+                "-s",
+                &dev,
+                "mklabel",
+                "msdos",
+                "mkpart",
+                "primary",
+                "fat32",
+                "1MiB",
+                "1025MiB",
+                "set",
+                "1",
+                "boot",
+                "on",
+                "mkpart",
+                "primary",
+                "ntfs",
+                "1025MiB",
+                "100%",
+            ])
+            .status()
+            .context("Failed to run parted for Windows USB layout")?;
+
+        if !status.success() {
+            anyhow::bail!("parted failed while creating partition layout on {}", dev);
+        }
+
+        let _ = Command::new("partprobe").arg(&dev).status();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        let (p1, p2) = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
+            (
+                format!("/dev/{}p1", drive.id),
+                format!("/dev/{}p2", drive.id),
+            )
+        } else {
+            (format!("/dev/{}1", drive.id), format!("/dev/{}2", drive.id))
+        };
+
+        let _ = Command::new("mkfs.vfat")
+            .args(["-F", "32", "-n", "WINBOOT", &p1])
+            .status();
+
+        let ntfs_ok = Command::new("mkfs.ntfs")
+            .args(["-Q", "-L", "WINSETUP", &p2])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ntfs_ok {
+            let _ = Command::new("mkfs.exfat")
+                .args(["-n", "WINSETUP", &p2])
+                .status();
+        }
+
+        let m2 = Command::new("mount")
+            .args([p1.as_str(), &efi_mnt.to_string_lossy()])
+            .status()?;
+        let m3 = Command::new("mount")
+            .args([p2.as_str(), &data_mnt.to_string_lossy()])
+            .status()?;
+
+        if !m2.success() || !m3.success() {
+            anyhow::bail!("Failed to mount target USB partitions on Linux");
+        }
+
+        copy_and_verify_windows_tree(
+            &iso_mnt,
+            Some(&efi_mnt),
+            &data_mnt,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    } else {
+        let status = Command::new("parted")
+            .args([
+                "-s",
+                &dev,
+                "mklabel",
+                "msdos",
+                "mkpart",
+                "primary",
+                "fat32",
+                "1MiB",
+                "100%",
+                "set",
+                "1",
+                "boot",
+                "on",
+            ])
+            .status()
+            .context("Failed to run parted for FAT32 Windows USB layout")?;
+
+        if !status.success() {
+            anyhow::bail!("parted failed while creating FAT32 layout on {}", dev);
+        }
+
+        let _ = Command::new("partprobe").arg(&dev).status();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        let p1 = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
+            format!("/dev/{}p1", drive.id)
+        } else {
+            format!("/dev/{}1", drive.id)
+        };
+
+        let _ = Command::new("mkfs.vfat")
+            .args(["-F", "32", "-n", "WINSETUP", &p1])
+            .status();
+
+        let m3 = Command::new("mount")
+            .args([p1.as_str(), &data_mnt.to_string_lossy()])
+            .status()?;
+        if !m3.success() {
+            anyhow::bail!("Failed to mount FAT32 USB partition on Linux");
+        }
+
+        copy_and_verify_windows_tree(
+            &iso_mnt,
+            None,
+            &data_mnt,
+            cancel_flag,
+            &mut on_progress,
+        )?;
+    }
+
+    Ok(iso_hash)
+}

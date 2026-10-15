@@ -1,4 +1,5 @@
 pub mod platform;
+pub mod windows_iso;
 
 use anyhow::{Context, Result};
 use bzip2_rs::DecoderReader as Bz2Decoder;
@@ -34,6 +35,7 @@ pub struct ImageMetadata {
     pub file_size: u64,
     pub compression: &'static str,
     pub is_compressed: bool,
+    pub is_windows_udf_iso: bool,
     pub scheme: String,
     pub warning: Option<String>,
 }
@@ -171,11 +173,7 @@ pub fn normalize_sha256_input(raw: &str) -> Option<String> {
         .unwrap_or(trimmed)
         .trim();
     let token = cleaned.split_whitespace().next().unwrap_or("");
-    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(token.to_ascii_lowercase())
-    } else {
-        Some(token.to_ascii_lowercase())
-    }
+    Some(token.to_ascii_lowercase())
 }
 
 pub fn reset_and_format_drive(drive: &UsbDrive, label: &str) -> Result<()> {
@@ -187,7 +185,6 @@ pub fn reset_and_format_drive(drive: &UsbDrive, label: &str) -> Result<()> {
         };
         let device = guard.device.as_mut().unwrap();
 
-        // Wipe both Backup GPT (last 64 KB) and Primary MBR/GPT (first 2 MB)
         wipe_stale_backup_gpt(device, drive.size_bytes);
         let zeros = vec![0u8; CHUNK_SIZE * 2];
         let _ = device.seek(SeekFrom::Start(0));
@@ -248,8 +245,9 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
         CompressionKind::Gzip => Ok(Box::new(MultiGzDecoder::new(reader))),
         CompressionKind::Bzip2 => Ok(Box::new(Bz2Decoder::new(reader))),
         CompressionKind::Zstd => {
-            let dec = ruzstd::StreamingDecoder::new(reader)
-                .map_err(|e| anyhow::anyhow!("Failed to initialize Zstandard (.zst) decoder: {}", e))?;
+            let dec = ruzstd::StreamingDecoder::new(reader).map_err(|e| {
+                anyhow::anyhow!("Failed to initialize Zstandard (.zst) decoder: {}", e)
+            })?;
             Ok(Box::new(dec))
         }
         CompressionKind::Xz => {
@@ -265,7 +263,8 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
                 if is_lzma_alone {
                     if let Err(e) = lzma_rs::lzma_decompress(&mut buf_reader, &mut writer) {
                         let msg = e.to_string();
-                        if !msg.contains("decompression pipe closed") && !msg.contains("BrokenPipe")
+                        if !msg.contains("decompression pipe closed")
+                            && !msg.contains("BrokenPipe")
                         {
                             let _ = tx.send(Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -274,7 +273,6 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
                         }
                     }
                 } else {
-                    // Multi-stream concatenated .xz decoder loop (handles pixz/pxz/xz -T0 archives)
                     loop {
                         let has_more = loop {
                             match buf_reader.fill_buf() {
@@ -301,7 +299,8 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
                                 break;
                             }
                             Ok(true) => {
-                                if let Err(e) = lzma_rs::xz_decompress(&mut buf_reader, &mut writer)
+                                if let Err(e) =
+                                    lzma_rs::xz_decompress(&mut buf_reader, &mut writer)
                                 {
                                     let msg = e.to_string();
                                     if !msg.contains("decompression pipe closed")
@@ -353,6 +352,8 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
     let has_iso9660 = n >= 0x8006
         && (&header[0x8001..0x8006] == b"CD001" || &header[0x8001..0x8006] == b"BEA01");
 
+    let is_windows_udf_iso = has_iso9660 && !has_mbr_sig && kind == CompressionKind::None;
+
     let (scheme, warning) = if has_iso9660 && has_mbr_sig && has_gpt_sig {
         ("ISOHybrid (MBR + GPT + ISO9660)".to_string(), None)
     } else if has_iso9660 && has_mbr_sig {
@@ -363,13 +364,10 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
         ("Bootable MBR Disk Image".to_string(), None)
     } else if has_apm_sig {
         ("Apple Partition Map Image".to_string(), None)
-    } else if has_iso9660 && !has_mbr_sig {
+    } else if is_windows_udf_iso {
         (
-            "Non-Hybrid Optical ISO (UDF / ISO9660)".to_string(),
-            Some(
-                "Windows / Non-Hybrid Optical ISO detected (lacks an MBR/GPT partition table at Sector 0). Raw sector flashing will not boot Windows Setup without a UDF/UEFI:NTFS formatter."
-                    .to_string(),
-            ),
+            "Windows 10/11 UDF Installer (Auto-UEFI Builder)".to_string(),
+            None,
         )
     } else if has_koly_trailer {
         (
@@ -393,6 +391,7 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
         file_size,
         compression: kind.label(),
         is_compressed: kind != CompressionKind::None,
+        is_windows_udf_iso,
         scheme,
         warning,
     })
@@ -508,6 +507,17 @@ where
             "Safety lock: The selected image file resides on the target USB drive ({}). Copy the image to your internal disk first.",
             drive.id
         );
+    }
+
+    if let Ok(meta) = inspect_image(image_path) {
+        if meta.is_windows_udf_iso {
+            return windows_iso::flash_windows_iso_to_usb(
+                image_path,
+                drive,
+                cancel_flag,
+                on_progress,
+            );
+        }
     }
 
     let img_file = File::open(image_path)

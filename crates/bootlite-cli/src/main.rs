@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "bootlite-cli",
-    version = "0.2.1",
+    version = "0.3.1",
     about = "Raw Hardware USB Flasher & SHA-256 Verifier"
 )]
 struct Cli {
