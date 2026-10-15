@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use bootlite_core::{
-    compute_image_sha256, eject_drive, flash_and_verify, inspect_image, is_image_on_drive,
-    list_safe_usb_drives, normalize_sha256_input, reset_and_format_drive, ImageMetadata, UsbDrive,
+use bootlite_core::{flash_and_verify_with_scheme, PartitionScheme,
+    compute_image_sha256, eject_drive, inspect_image, is_image_on_drive,
+    list_safe_usb_drives, normalize_sha256_input, reset_and_format_drive_with_scheme, windows_iso::WIN_ISO_OVERHEAD_BYTES, ImageMetadata, UsbDrive,
 };
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 use std::fs;
@@ -466,6 +466,7 @@ struct BootLiteApp {
     selected_drive_idx: Option<usize>,
     allow_virtual: bool,
     auto_eject: bool,
+    partition_scheme: PartitionScheme,
     show_confirm_modal: bool,
     show_reset_modal: bool,
     show_exit_modal: bool,
@@ -483,7 +484,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.3.1 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.3.3 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -503,6 +504,7 @@ impl BootLiteApp {
             selected_drive_idx: None,
             allow_virtual: false,
             auto_eject: false,
+            partition_scheme: PartitionScheme::Auto,
             show_confirm_modal: false,
             show_reset_modal: false,
             show_exit_modal: false,
@@ -720,6 +722,7 @@ impl BootLiteApp {
     fn start_reset_drive(&mut self) {
         let Some(idx) = self.selected_drive_idx else { return };
         let Some(drive) = self.drives.get(idx).cloned() else { return };
+        let scheme = self.partition_scheme;
 
         let status_clone = Arc::clone(&self.status);
         let logs_clone = Arc::clone(&self.logs);
@@ -747,7 +750,7 @@ impl BootLiteApp {
 
         thread::spawn(move || {
             let start = Instant::now();
-            match reset_and_format_drive(&drive, "BOOTLITE") {
+            match reset_and_format_drive_with_scheme(&drive, "BOOTLITE", scheme) {
                 Ok(()) => {
                     let elapsed = start.elapsed().as_secs();
                     push_log(
@@ -777,6 +780,7 @@ impl BootLiteApp {
         let Some(drive) = self.drives.get(idx).cloned() else { return };
         let expected_opt = normalize_sha256_input(&self.expected_sha256);
         let should_eject = self.auto_eject;
+        let scheme = self.partition_scheme;
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let cancel_clone = Arc::clone(&self.cancel_flag);
@@ -825,7 +829,7 @@ impl BootLiteApp {
             let mut last_phase = String::new();
             let mut last_logged_bucket: u64 = 0;
 
-            let result = flash_and_verify(&image_path, &drive, Some(&cancel_clone), |prog| {
+            let result = flash_and_verify_with_scheme(&image_path, &drive, scheme, Some(&cancel_clone), |prog| {
                 let fraction = if prog.total_bytes > 0 {
                     (prog.bytes_processed as f32 / prog.total_bytes as f32).clamp(0.0, 1.0)
                 } else {
@@ -998,7 +1002,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.3.1",
+                                "v0.3.3",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -1292,6 +1296,16 @@ impl eframe::App for BootLiteApp {
                     .as_ref()
                     .map(|m| m.is_compressed)
                     .unwrap_or(false);
+                let is_win_iso = self
+                    .image_meta
+                    .as_ref()
+                    .map(|m| m.is_windows_udf_iso)
+                    .unwrap_or(false);
+                let required_bytes = if is_win_iso {
+                    self.image_size + WIN_ISO_OVERHEAD_BYTES
+                } else {
+                    self.image_size
+                };
 
                 egui::Frame::default()
                     .fill(BG_CARD)
@@ -1388,7 +1402,7 @@ impl eframe::App for BootLiteApp {
                                         let is_selected = self.selected_drive_idx == Some(idx);
                                         let too_small = has_img
                                             && !is_compressed
-                                            && self.image_size > d.size_bytes;
+                                            && required_bytes > d.size_bytes;
                                         let source_on_target = self
                                             .image_path
                                             .as_ref()
@@ -1499,7 +1513,7 @@ impl eframe::App for BootLiteApp {
                     .selected_drive_idx
                     .and_then(|idx| self.drives.get(idx))
                     .map(|d| {
-                        let fits = is_compressed || self.image_size <= d.size_bytes;
+                        let fits = is_compressed || required_bytes <= d.size_bytes;
                         let not_same = self
                             .image_path
                             .as_ref()
@@ -1519,10 +1533,38 @@ impl eframe::App for BootLiteApp {
                         ui.horizontal(|ui| {
                             draw_toggle_switch(ui, &mut self.auto_eject);
                             ui.label(
-                                RichText::new("Auto-Eject on Finish")
-                                    .size(12.0)
+                                RichText::new("Auto-Eject")
+                                    .size(11.5)
                                     .color(TEXT_SUB),
                             );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Scheme:")
+                                    .size(11.5)
+                                    .color(TEXT_SUB),
+                            );
+                            for (s, lbl) in [
+                                (PartitionScheme::Auto, "Auto"),
+                                (PartitionScheme::Gpt, "GPT"),
+                                (PartitionScheme::Mbr, "MBR"),
+                            ] {
+                                let active = self.partition_scheme == s;
+                                let btn = egui::Button::new(
+                                    RichText::new(lbl)
+                                        .size(11.0)
+                                        .strong()
+                                        .color(if active { Color32::WHITE } else { TEXT_SUB }),
+                                )
+                                .fill(if active {
+                                    ACCENT_PRIMARY
+                                } else {
+                                    Color32::from_rgb(30, 41, 59)
+                                })
+                                .rounding(5.0);
+                                if ui.add(btn).clicked() {
+                                    self.partition_scheme = s;
+                                }
+                            }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_enabled_ui(can_flash, |ui| {

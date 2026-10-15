@@ -1,17 +1,26 @@
 use anyhow::{Context, Result};
 use bootlite_core::{
-    eject_drive, flash_and_verify, inspect_image, list_safe_usb_drives, normalize_sha256_input,
-    reset_and_format_drive,
+    eject_drive, flash_and_verify_with_scheme, inspect_image, list_safe_usb_drives,
+    normalize_sha256_input, reset_and_format_drive_with_scheme, PartitionScheme,
 };
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 
+fn parse_scheme(s: &str) -> Result<PartitionScheme> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(PartitionScheme::Auto),
+        "gpt" => Ok(PartitionScheme::Gpt),
+        "mbr" => Ok(PartitionScheme::Mbr),
+        other => anyhow::bail!("Invalid partition scheme '{}' (use auto, gpt, or mbr)", other),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "bootlite-cli",
-    version = "0.3.1",
-    about = "Raw Hardware USB Flasher & SHA-256 Verifier"
+    version = "0.3.3",
+    about = "Raw Hardware USB Flasher, Windows 10/11 UEFI Builder & SHA-256 Verifier"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +45,8 @@ enum Commands {
         image: PathBuf,
         #[arg(short, long, help = "Target drive ID (e.g., disk2, sdb, PhysicalDrive1)")]
         drive: String,
+        #[arg(long, default_value = "auto", help = "Partition scheme: auto, gpt, or mbr")]
+        scheme: String,
         #[arg(long, help = "Optional expected SHA-256 hash to verify against")]
         expected_sha256: Option<String>,
         #[arg(long, help = "Automatically eject the USB drive after verification")]
@@ -49,6 +60,8 @@ enum Commands {
         drive: String,
         #[arg(long, default_value = "BOOTLITE", help = "Volume label")]
         label: String,
+        #[arg(long, default_value = "auto", help = "Partition scheme: auto, gpt, or mbr")]
+        scheme: String,
         #[arg(long, help = "Allow resetting virtual disks")]
         virtual_disks: bool,
     },
@@ -90,12 +103,19 @@ fn main() -> Result<()> {
         Commands::Flash {
             image,
             drive,
+            scheme,
             expected_sha256,
             eject,
             virtual_disks,
         } => {
+            let parsed_scheme = parse_scheme(&scheme)?;
             let meta = inspect_image(&image)?;
-            println!("Image Layout: {} ({})", meta.scheme, meta.compression);
+            println!(
+                "Image Layout: {} ({}) | Scheme: {}",
+                meta.scheme,
+                meta.compression,
+                parsed_scheme.label()
+            );
             if let Some(warn) = &meta.warning {
                 eprintln!("WARNING: {}", warn);
             }
@@ -114,11 +134,12 @@ fn main() -> Result<()> {
                 .progress_chars("#>-"),
             );
 
-            let hash = flash_and_verify(&image, &target, None, |prog| {
-                pb.set_length(prog.total_bytes);
-                pb.set_position(prog.bytes_processed);
-                pb.set_message(format!("{} ({:.1} MB/s)", prog.phase, prog.speed_mbps));
-            })?;
+            let hash =
+                flash_and_verify_with_scheme(&image, &target, parsed_scheme, None, |prog| {
+                    pb.set_length(prog.total_bytes);
+                    pb.set_position(prog.bytes_processed);
+                    pb.set_message(format!("{} ({:.1} MB/s)", prog.phase, prog.speed_mbps));
+                })?;
             pb.finish_with_message("Verified!");
 
             println!("Hardware SHA-256: {}", hash);
@@ -143,18 +164,23 @@ fn main() -> Result<()> {
         Commands::Reset {
             drive,
             label,
+            scheme,
             virtual_disks,
         } => {
+            let parsed_scheme = parse_scheme(&scheme)?;
             let drives = list_safe_usb_drives(virtual_disks)?;
             let target = drives
                 .into_iter()
                 .find(|d| d.id == drive)
                 .with_context(|| format!("Target drive '{}' not found or locked for safety", drive))?;
             println!(
-                "Wiping partition tables and formatting {} ({}) as ExFAT [{}]...",
-                target.model, target.id, label
+                "Wiping partition tables and formatting {} ({}) as ExFAT [{}] ({})...",
+                target.model,
+                target.id,
+                label,
+                parsed_scheme.label()
             );
-            reset_and_format_drive(&target, &label)?;
+            reset_and_format_drive_with_scheme(&target, &label, parsed_scheme)?;
             println!("Drive {} successfully restored to full capacity.", target.id);
         }
     }

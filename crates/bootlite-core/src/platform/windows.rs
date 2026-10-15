@@ -1,4 +1,4 @@
-use crate::UsbDrive;
+use crate::{PartitionScheme, UsbDrive};
 use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -525,13 +525,20 @@ pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
     Ok(())
 }
 
-pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme) -> Result<()> {
     let Some(disk_num) = extract_disk_number(drive) else {
         anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
     };
     if disk_num == 0 || drive.is_system || volume_path_belongs_to_disk(r"\\.\C:", disk_num) {
         anyhow::bail!("Safety lock: Refusing to format system boot drive");
     }
+
+    finish_device(None);
+
+    let convert_cmd = match scheme {
+        PartitionScheme::Gpt => "convert gpt",
+        PartitionScheme::Auto | PartitionScheme::Mbr => "convert mbr",
+    };
 
     let mut child = Command::new("diskpart")
         .creation_flags(CREATE_NO_WINDOW)
@@ -543,8 +550,8 @@ pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
 
     if let Some(mut stdin) = child.stdin.take() {
         let script = format!(
-            "select disk {}\r\nattributes disk clear readonly\r\nclean\r\ncreate partition primary\r\nformat fs=exfat label=\"{}\" quick\r\nassign\r\nexit\r\n",
-            disk_num, label
+            "select disk {}\r\nattributes disk clear readonly\r\nclean\r\n{}\r\ncreate partition primary\r\nformat fs=exfat label=\"{}\" quick\r\nassign\r\nexit\r\n",
+            disk_num, convert_cmd, label
         );
         let _ = stdin.write_all(script.as_bytes());
     }

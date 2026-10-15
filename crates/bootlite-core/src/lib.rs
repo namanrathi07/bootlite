@@ -19,6 +19,23 @@ const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB (256 x 4096-byte sectors)
 const SECTOR_ALIGN: usize = 4096;
 const MAX_IO_RETRIES: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PartitionScheme {
+    Auto,
+    Gpt,
+    Mbr,
+}
+
+impl PartitionScheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Recommended)",
+            Self::Gpt => "GPT (UEFI)",
+            Self::Mbr => "MBR (BIOS / UEFI-CSM)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDrive {
     pub id: String,
@@ -177,6 +194,14 @@ pub fn normalize_sha256_input(raw: &str) -> Option<String> {
 }
 
 pub fn reset_and_format_drive(drive: &UsbDrive, label: &str) -> Result<()> {
+    reset_and_format_drive_with_scheme(drive, label, PartitionScheme::Auto)
+}
+
+pub fn reset_and_format_drive_with_scheme(
+    drive: &UsbDrive,
+    label: &str,
+    scheme: PartitionScheme,
+) -> Result<()> {
     platform::unmount_drive(drive)?;
     {
         let raw_file = platform::open_raw_device(drive)?;
@@ -191,7 +216,7 @@ pub fn reset_and_format_drive(drive: &UsbDrive, label: &str) -> Result<()> {
         let _ = device.write_all(&zeros);
         let _ = platform::prepare_for_verify(device);
     }
-    platform::format_drive_exfat(drive, label)
+    platform::format_drive_exfat(drive, label, scheme)
 }
 
 pub fn compute_image_sha256<F>(
@@ -349,14 +374,24 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
     let has_mbr_sig = n >= 512 && header[510] == 0x55 && header[511] == 0xAA;
     let has_gpt_sig = n >= 520 && &header[512..520] == b"EFI PART";
     let has_apm_sig = n >= 514 && (&header[512..514] == b"PM" || &header[0..2] == b"ER");
-    let has_iso9660 = n >= 0x8006
-        && (&header[0x8001..0x8006] == b"CD001" || &header[0x8001..0x8006] == b"BEA01");
 
-    let is_windows_udf_iso = has_iso9660 && !has_mbr_sig && kind == CompressionKind::None;
+    // Check ISO9660 & UDF Volume Descriptors at 0x8001, 0x8801, and 0x9001
+    let mut has_iso_or_udf = false;
+    for offset in [0x8001usize, 0x8801usize, 0x9001usize] {
+        if n >= offset + 5 {
+            let sig = &header[offset..offset + 5];
+            if sig == b"CD001" || sig == b"BEA01" || sig == b"NSR02" || sig == b"NSR03" {
+                has_iso_or_udf = true;
+                break;
+            }
+        }
+    }
 
-    let (scheme, warning) = if has_iso9660 && has_mbr_sig && has_gpt_sig {
+    let is_windows_udf_iso = has_iso_or_udf && !has_mbr_sig && kind == CompressionKind::None;
+
+    let (scheme, warning) = if has_iso_or_udf && has_mbr_sig && has_gpt_sig {
         ("ISOHybrid (MBR + GPT + ISO9660)".to_string(), None)
-    } else if has_iso9660 && has_mbr_sig {
+    } else if has_iso_or_udf && has_mbr_sig {
         ("ISOHybrid Bootable Image (MBR + ISO9660)".to_string(), None)
     } else if has_gpt_sig {
         ("Bootable GPT Disk Image".to_string(), None)
@@ -497,6 +532,25 @@ pub fn flash_and_verify<F>(
     image_path: &Path,
     drive: &UsbDrive,
     cancel_flag: Option<&AtomicBool>,
+    on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    flash_and_verify_with_scheme(
+        image_path,
+        drive,
+        PartitionScheme::Auto,
+        cancel_flag,
+        on_progress,
+    )
+}
+
+pub fn flash_and_verify_with_scheme<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    scheme: PartitionScheme,
+    cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
 where
@@ -514,6 +568,7 @@ where
             return windows_iso::flash_windows_iso_to_usb(
                 image_path,
                 drive,
+                scheme,
                 cancel_flag,
                 on_progress,
             );

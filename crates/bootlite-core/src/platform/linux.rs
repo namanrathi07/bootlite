@@ -1,4 +1,4 @@
-use crate::UsbDrive;
+use crate::{PartitionScheme, UsbDrive};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -242,16 +242,23 @@ pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
     Ok(())
 }
 
-pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme) -> Result<()> {
     if drive.is_system {
         anyhow::bail!("Safety lock: Refusing to format system drive");
     }
     let dev = format!("/dev/{}", drive.id);
+    let table = match scheme {
+        PartitionScheme::Gpt => "gpt",
+        PartitionScheme::Auto | PartitionScheme::Mbr => "msdos",
+    };
     let _ = Command::new("parted")
         .args([
-            "-s", &dev, "mklabel", "msdos", "mkpart", "primary", "ntfs", "1MiB", "100%",
+            "-s", &dev, "mklabel", table, "mkpart", "primary", "ntfs", "1MiB", "100%",
         ])
         .status();
+
+    let _ = Command::new("partprobe").arg(&dev).status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     let part = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
         format!("/dev/{}p1", drive.id)

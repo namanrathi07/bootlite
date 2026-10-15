@@ -1,4 +1,4 @@
-use crate::UsbDrive;
+use crate::{PartitionScheme, UsbDrive};
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
@@ -185,16 +185,20 @@ pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
     Ok(())
 }
 
-pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme) -> Result<()> {
     if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
         anyhow::bail!("Safety lock: Refusing to format internal system disk");
     }
+    let map_format = match scheme {
+        PartitionScheme::Gpt => "GPTFormat",
+        PartitionScheme::Auto | PartitionScheme::Mbr => "MBRFormat",
+    };
     let status = Command::new("diskutil")
         .args([
             "eraseDisk",
             "ExFAT",
             label,
-            "MBRFormat",
+            map_format,
             &format!("/dev/{}", drive.id),
         ])
         .status()

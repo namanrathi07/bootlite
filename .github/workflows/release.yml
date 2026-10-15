@@ -1,0 +1,91 @@
+name: Build & Release Multi-OS Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build macOS .app and .dmg
+        run: |
+          chmod +x scripts/bundle-macos.sh
+          ./scripts/bundle-macos.sh
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: BootLite-macOS-AppleSilicon.dmg
+          path: dist/BootLite-macOS-AppleSilicon.dmg
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GUI & GTK3/X11/Wayland headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - name: Build Linux Release Binaries
+        run: |
+          cargo build --release --workspace
+          mkdir -p dist/bootlite-linux-x86_64
+          cp target/release/bootlite-gui dist/bootlite-linux-x86_64/
+          cp target/release/bootlite-cli dist/bootlite-linux-x86_64/
+          tar -czvf dist/BootLite-Linux-x86_64.tar.gz -C dist bootlite-linux-x86_64
+      - name: Upload Linux Tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: BootLite-Linux-x86_64.tar.gz
+          path: dist/BootLite-Linux-x86_64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows Static Portable Executables
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --workspace
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target\release\bootlite-gui.exe dist\BootLite-Windows-x86_64-Portable.exe
+          Copy-Item target\release\bootlite-cli.exe dist\bootlite-cli-Windows-x86_64.exe
+      - name: Upload Windows Portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: BootLite-Windows-Binaries
+          path: dist/*.exe
+
+  publish-release:
+    needs: [build-macos, build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
