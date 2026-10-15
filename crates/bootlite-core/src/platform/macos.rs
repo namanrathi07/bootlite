@@ -170,3 +170,37 @@ pub fn prepare_for_verify(file: &mut File) -> Result<()> {
 }
 
 pub fn finish_device(_file: Option<File>) {}
+
+pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
+    if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to eject internal system disk");
+    }
+    let status = Command::new("diskutil")
+        .args(["eject", &format!("/dev/{}", drive.id)])
+        .status()
+        .context("Failed to execute diskutil eject")?;
+    if !status.success() {
+        anyhow::bail!("diskutil failed to eject /dev/{}", drive.id);
+    }
+    Ok(())
+}
+
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+    if drive.bus.eq_ignore_ascii_case("Apple Fabric") || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to format internal system disk");
+    }
+    let status = Command::new("diskutil")
+        .args([
+            "eraseDisk",
+            "ExFAT",
+            label,
+            "MBRFormat",
+            &format!("/dev/{}", drive.id),
+        ])
+        .status()
+        .context("Failed to execute diskutil eraseDisk")?;
+    if !status.success() {
+        anyhow::bail!("diskutil eraseDisk failed on /dev/{}", drive.id);
+    }
+    Ok(())
+}

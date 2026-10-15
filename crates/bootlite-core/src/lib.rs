@@ -1,11 +1,12 @@
 pub mod platform;
 
 use anyhow::{Context, Result};
+use bzip2_rs::DecoderReader as Bz2Decoder;
 use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -49,6 +50,7 @@ pub struct FlashProgress<'a> {
 enum CompressionKind {
     None,
     Gzip,
+    Bzip2,
     Xz,
     Zstd,
 }
@@ -61,8 +63,9 @@ impl CompressionKind {
             .unwrap_or("")
             .to_ascii_lowercase();
         match ext.as_str() {
-            "gz" | "gzip" => Self::Gzip,
-            "xz" | "lzma" => Self::Xz,
+            "gz" | "gzip" | "tgz" => Self::Gzip,
+            "bz2" | "bzip2" | "tbz2" => Self::Bzip2,
+            "xz" | "lzma" | "txz" => Self::Xz,
             "zst" | "zstd" => Self::Zstd,
             _ => Self::None,
         }
@@ -71,8 +74,9 @@ impl CompressionKind {
     fn label(self) -> &'static str {
         match self {
             Self::None => "Direct 1 MB Unbuffered Stream",
-            Self::Gzip => "On-the-Fly GZIP Decompressor",
-            Self::Xz => "On-the-Fly XZ / LZMA2 Stream",
+            Self::Gzip => "On-the-Fly Multi-GZIP Stream",
+            Self::Bzip2 => "On-the-Fly BZip2 (.bz2) Stream",
+            Self::Xz => "On-the-Fly Multi-Stream XZ / LZMA2",
             Self::Zstd => "On-the-Fly Zstandard (.zst) Stream",
         }
     }
@@ -150,6 +154,91 @@ pub fn is_image_on_drive(image_path: &Path, drive: &UsbDrive) -> bool {
     platform::is_path_on_drive(image_path, drive)
 }
 
+pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
+    platform::eject_drive(drive)
+}
+
+pub fn normalize_sha256_input(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned = trimmed
+        .strip_prefix("SHA256:")
+        .or_else(|| trimmed.strip_prefix("sha256:"))
+        .or_else(|| trimmed.strip_prefix("SHA-256:"))
+        .or_else(|| trimmed.strip_prefix("sha-256:"))
+        .unwrap_or(trimmed)
+        .trim();
+    let token = cleaned.split_whitespace().next().unwrap_or("");
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(token.to_ascii_lowercase())
+    } else {
+        Some(token.to_ascii_lowercase())
+    }
+}
+
+pub fn reset_and_format_drive(drive: &UsbDrive, label: &str) -> Result<()> {
+    platform::unmount_drive(drive)?;
+    {
+        let raw_file = platform::open_raw_device(drive)?;
+        let mut guard = DeviceCleanupGuard {
+            device: Some(raw_file),
+        };
+        let device = guard.device.as_mut().unwrap();
+
+        // Wipe both Backup GPT (last 64 KB) and Primary MBR/GPT (first 2 MB)
+        wipe_stale_backup_gpt(device, drive.size_bytes);
+        let zeros = vec![0u8; CHUNK_SIZE * 2];
+        let _ = device.seek(SeekFrom::Start(0));
+        let _ = device.write_all(&zeros);
+        let _ = platform::prepare_for_verify(device);
+    }
+    platform::format_drive_exfat(drive, label)
+}
+
+pub fn compute_image_sha256<F>(
+    image_path: &Path,
+    cancel_flag: Option<&AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    let file = File::open(image_path)
+        .with_context(|| format!("Failed to open image file: {}", image_path.display()))?;
+    let total_bytes = file.metadata()?.len().max(1);
+    let mut reader = BufReader::with_capacity(CHUNK_SIZE, file);
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut hasher = Sha256::new();
+    let mut processed: u64 = 0;
+    let start = Instant::now();
+
+    loop {
+        if let Some(flag) = cancel_flag {
+            if flag.load(Ordering::Relaxed) {
+                anyhow::bail!("Hash calculation cancelled by user");
+            }
+        }
+        let n = read_full_chunk(&mut reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        processed += n as u64;
+        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+        let speed_mbps = (processed as f64 / (1024.0 * 1024.0)) / elapsed;
+        on_progress(FlashProgress {
+            phase: "Computing file SHA-256...",
+            bytes_processed: processed,
+            total_bytes,
+            speed_mbps,
+        });
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn open_decompressed_stream<R: Read + Send + 'static>(
     reader: R,
     kind: CompressionKind,
@@ -157,6 +246,7 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
     match kind {
         CompressionKind::None => Ok(Box::new(reader)),
         CompressionKind::Gzip => Ok(Box::new(MultiGzDecoder::new(reader))),
+        CompressionKind::Bzip2 => Ok(Box::new(Bz2Decoder::new(reader))),
         CompressionKind::Zstd => {
             let dec = ruzstd::StreamingDecoder::new(reader)
                 .map_err(|e| anyhow::anyhow!("Failed to initialize Zstandard (.zst) decoder: {}", e))?;
@@ -167,14 +257,65 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
             thread::spawn(move || {
                 let mut buf_reader = BufReader::with_capacity(256 * 1024, reader);
                 let mut writer = PipeWriter { tx: tx.clone() };
-                if let Err(e) = lzma_rs::xz_decompress(&mut buf_reader, &mut writer) {
-                    // Ignore BrokenPipe if caller only peeked at the header (e.g. inspect_image)
-                    let msg = e.to_string();
-                    if !msg.contains("decompression pipe closed") && !msg.contains("BrokenPipe") {
-                        let _ = tx.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("XZ stream decompression failed: {}", e),
-                        )));
+                let is_lzma_alone = match buf_reader.fill_buf() {
+                    Ok(b) if b.len() >= 6 => &b[0..6] != b"\xFD7zXZ\x00",
+                    _ => false,
+                };
+
+                if is_lzma_alone {
+                    if let Err(e) = lzma_rs::lzma_decompress(&mut buf_reader, &mut writer) {
+                        let msg = e.to_string();
+                        if !msg.contains("decompression pipe closed") && !msg.contains("BrokenPipe")
+                        {
+                            let _ = tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("LZMA stream decompression failed: {}", e),
+                            )));
+                        }
+                    }
+                } else {
+                    // Multi-stream concatenated .xz decoder loop (handles pixz/pxz/xz -T0 archives)
+                    loop {
+                        let has_more = loop {
+                            match buf_reader.fill_buf() {
+                                Ok([]) => break Ok(false),
+                                Ok(buf) => {
+                                    let pad_zeros = buf.iter().take_while(|&&b| b == 0).count();
+                                    if pad_zeros > 0 {
+                                        buf_reader.consume(pad_zeros);
+                                    } else {
+                                        break Ok(true);
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue
+                                }
+                                Err(e) => break Err(e),
+                            }
+                        };
+
+                        match has_more {
+                            Ok(false) => break,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                break;
+                            }
+                            Ok(true) => {
+                                if let Err(e) = lzma_rs::xz_decompress(&mut buf_reader, &mut writer)
+                                {
+                                    let msg = e.to_string();
+                                    if !msg.contains("decompression pipe closed")
+                                        && !msg.contains("BrokenPipe")
+                                    {
+                                        let _ = tx.send(Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("XZ stream decompression failed: {}", e),
+                                        )));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -192,7 +333,6 @@ pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
     let file_size = file.metadata()?.len();
     let kind = CompressionKind::from_path(image_path);
 
-    // Check if raw file has an Apple UDIF 'koly' trailer in the last 512 bytes
     let mut has_koly_trailer = false;
     if kind == CompressionKind::None && file_size >= 512 {
         let mut trailer = [0u8; 512];
@@ -340,7 +480,7 @@ fn read_chunk_with_retry(
 }
 
 fn wipe_stale_backup_gpt(device: &mut File, drive_size: u64) {
-    let wipe_len: u64 = 65536; // 64 KB covers the 33-sector Backup GPT header & partition array
+    let wipe_len: u64 = 65536;
     if drive_size > CHUNK_SIZE as u64 * 4 {
         let aligned_end = drive_size & !((SECTOR_ALIGN as u64) - 1);
         if aligned_end > wipe_len {
@@ -384,17 +524,14 @@ where
         );
     }
 
-    // 1. Unmount & lock target USB drive volumes
     platform::unmount_drive(drive)?;
 
-    // 2. Open single raw hardware handle for both Write & Read-Back Verification
     let raw_file = platform::open_raw_device(drive)?;
     let mut guard = DeviceCleanupGuard {
         device: Some(raw_file),
     };
     let device = guard.device.as_mut().unwrap();
 
-    // 3. Clear any leftover Backup GPT table at the end of the physical USB drive
     wipe_stale_backup_gpt(device, drive.size_bytes);
 
     let compressed_pos = Arc::new(AtomicU64::new(0));
@@ -488,7 +625,6 @@ where
     let expected_full_hash = format!("{:x}", full_source_hasher.finalize());
     let expected_tail_hash = format!("{:x}", tail_source_hasher.finalize());
 
-    // 4. Sector-by-Sector Read-Back Verification (while Sector 0 remains zeroed)
     let verify_start = Instant::now();
     let mut tail_verify_hasher = Sha256::new();
     let mut verified_bytes: u64 = if deferred_first_chunk.is_some() {
@@ -544,7 +680,6 @@ where
         );
     }
 
-    // 5. Final Sector-0 Boot Record Commit & Hardware Read-Back Check
     if let Some(first_chunk) = deferred_first_chunk {
         device
             .seek(SeekFrom::Start(0))

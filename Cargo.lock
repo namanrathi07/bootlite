@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "bootlite-cli"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bootlite-core",
@@ -584,9 +584,10 @@ dependencies = [
 
 [[package]]
 name = "bootlite-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "bzip2-rs",
  "flate2",
  "libc",
  "lzma-rs",
@@ -598,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "bootlite-gui"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bootlite-core",
@@ -650,6 +651,16 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "bzip2-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beeb59e7e4c811ab37cc73680c798c7a5da77fc9989c62b09138e31ee740f735"
+dependencies = [
+ "crc32fast",
+ "tinyvec",
+]
 
 [[package]]
 name = "calloop"
@@ -3337,6 +3348,12 @@ dependencies = [
  "displaydoc",
  "zerovec",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"

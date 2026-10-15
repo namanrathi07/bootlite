@@ -2,9 +2,12 @@ use crate::UsbDrive;
 use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -12,9 +15,11 @@ use std::time::Duration;
 const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
 const FILE_SHARE_READ: u32 = 0x00000001;
 const FILE_SHARE_WRITE: u32 = 0x00000002;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const INVALID_HANDLE_VALUE: RawHandle = -1isize as RawHandle;
 
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
+const IOCTL_STORAGE_EJECT_MEDIA: u32 = 0x002D4808;
 const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x000700A0;
 const IOCTL_DISK_CREATE_DISK: u32 = 0x0007C058;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
@@ -51,7 +56,7 @@ extern "system" {
 
 #[repr(C)]
 struct CreateDiskRaw {
-    partition_style: u32, // 2 = PARTITION_STYLE_RAW
+    partition_style: u32,
     data: [u8; 20],
 }
 
@@ -315,7 +320,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
         let header: StorageDeviceDescriptorHeader =
             unsafe { std::ptr::read_unaligned(desc_buf.as_ptr() as *const _) };
 
-        // Win32 STORAGE_BUS_TYPE: 7 = USB, 12 = SD, 13 = MMC, 14..16 = Virtual
         let is_usb = header.bus_type == 7;
         let is_sd_mmc = header.bus_type == 12 || header.bus_type == 13;
         let is_removable = header.removable_media != 0;
@@ -393,7 +397,6 @@ pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
     };
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let s = abs.to_string_lossy();
-    // Handle both "E:\..." and "\\?\E:\..."
     let clean = s.strip_prefix(r"\\?\").unwrap_or(&s);
     let mut chars = clean.chars();
     if let (Some(letter), Some(':')) = (chars.next(), chars.next()) {
@@ -464,7 +467,7 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
     let _ = ioctl_none(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
 
     let raw_disk = CreateDiskRaw {
-        partition_style: 2, // PARTITION_STYLE_RAW
+        partition_style: 2,
         data: [0u8; 20],
     };
     let mut returned: u32 = 0;
@@ -498,4 +501,56 @@ pub fn finish_device(file: Option<File>) {
     if let Ok(mut locked) = LOCKED_VOLUMES.lock() {
         locked.clear();
     }
+}
+
+pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
+    if drive.id == "PhysicalDrive0" || drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to eject PhysicalDrive0");
+    }
+    let _ = unmount_drive(drive);
+    if let Ok(mut locked) = LOCKED_VOLUMES.lock() {
+        for vol in locked.iter() {
+            let _ = ioctl_none(vol.as_raw_handle(), IOCTL_STORAGE_EJECT_MEDIA);
+        }
+        locked.clear();
+    }
+    if let Ok(raw) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&drive.raw_device_path)
+    {
+        let _ = ioctl_none(raw.as_raw_handle(), IOCTL_STORAGE_EJECT_MEDIA);
+    }
+    Ok(())
+}
+
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+    let Some(disk_num) = extract_disk_number(drive) else {
+        anyhow::bail!("Invalid Windows PhysicalDrive identifier: {}", drive.id);
+    };
+    if disk_num == 0 || drive.is_system || volume_path_belongs_to_disk(r"\\.\C:", disk_num) {
+        anyhow::bail!("Safety lock: Refusing to format system boot drive");
+    }
+
+    let mut child = Command::new("diskpart")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn diskpart for drive formatting")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let script = format!(
+            "select disk {}\r\nattributes disk clear readonly\r\nclean\r\ncreate partition primary\r\nformat fs=exfat label=\"{}\" quick\r\nassign\r\nexit\r\n",
+            disk_num, label
+        );
+        let _ = stdin.write_all(script.as_bytes());
+    }
+    let status = child.wait().context("Failed waiting for diskpart")?;
+    if !status.success() {
+        anyhow::bail!("diskpart failed while formatting PhysicalDrive{}", disk_num);
+    }
+    Ok(())
 }

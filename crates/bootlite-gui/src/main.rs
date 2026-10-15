@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bootlite_core::{
-    flash_and_verify, inspect_image, is_image_on_drive, list_safe_usb_drives, ImageMetadata,
-    UsbDrive,
+    compute_image_sha256, eject_drive, flash_and_verify, inspect_image, is_image_on_drive,
+    list_safe_usb_drives, normalize_sha256_input, reset_and_format_drive, ImageMetadata, UsbDrive,
 };
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 use std::fs;
@@ -26,7 +26,6 @@ const TEXT_MAIN: Color32 = Color32::from_rgb(248, 250, 252);
 const TEXT_SUB: Color32 = Color32::from_rgb(148, 163, 184);
 const TEXT_DIM: Color32 = Color32::from_rgb(100, 116, 139);
 
-// Cross-platform OS Sleep & USB Power-Down Inhibitor while flashing
 struct SleepInhibitor {
     #[cfg(unix)]
     child: Option<std::process::Child>,
@@ -67,7 +66,6 @@ impl SleepInhibitor {
             extern "system" {
                 fn SetThreadExecutionState(es_flags: u32) -> u32;
             }
-            // ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x00000001) | ES_AWAYMODE_REQUIRED (0x00000040)
             unsafe {
                 let _ = SetThreadExecutionState(0x80000041);
             }
@@ -322,7 +320,7 @@ fn draw_usb_icon(ui: &mut egui::Ui, active: bool) {
 }
 
 fn draw_toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-    let desired_size = Vec2::new(36.0, 20.0);
+    let desired_size = Vec2::new(34.0, 18.0);
     let (rect, mut response) = ui.allocate_exact_size(desired_size, Sense::click());
     if response.clicked() {
         *on = !*on;
@@ -403,7 +401,7 @@ fn build_window_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([670.0, 720.0])
+            .with_inner_size([680.0, 745.0])
             .with_resizable(false)
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(build_window_icon())),
@@ -415,8 +413,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-            style.spacing.button_padding = Vec2::new(12.0, 7.0);
+            style.spacing.item_spacing = Vec2::new(10.0, 7.0);
+            style.spacing.button_padding = Vec2::new(12.0, 6.5);
             let mut visuals = egui::Visuals::dark();
             visuals.panel_fill = BG_APP;
             visuals.window_fill = BG_CARD;
@@ -450,6 +448,11 @@ enum JobStatus {
     Success {
         hash: String,
         elapsed_secs: u64,
+        ejected: bool,
+    },
+    ResetSuccess {
+        drive_name: String,
+        elapsed_secs: u64,
     },
     Error(String),
 }
@@ -458,10 +461,13 @@ struct BootLiteApp {
     image_path: Option<PathBuf>,
     image_size: u64,
     image_meta: Option<ImageMetadata>,
+    expected_sha256: String,
     drives: Vec<UsbDrive>,
     selected_drive_idx: Option<usize>,
     allow_virtual: bool,
+    auto_eject: bool,
     show_confirm_modal: bool,
+    show_reset_modal: bool,
     show_exit_modal: bool,
     allow_close: bool,
     show_log_drawer: bool,
@@ -477,7 +483,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.2.0 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.2.1 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -492,10 +498,13 @@ impl BootLiteApp {
             image_path: None,
             image_size: 0,
             image_meta: None,
+            expected_sha256: String::new(),
             drives: Vec::new(),
             selected_drive_idx: None,
             allow_virtual: false,
+            auto_eject: false,
             show_confirm_modal: false,
+            show_reset_modal: false,
             show_exit_modal: false,
             allow_close: false,
             show_log_drawer: true,
@@ -520,7 +529,7 @@ impl BootLiteApp {
             push_log(
                 &self.logs,
                 format!(
-                    "[WARN] Rejected directory '{}': Please select a disk image file (.iso, .img, .dmg, .gz, .xz, .zst)",
+                    "[WARN] Rejected directory '{}': Please select a disk image file (.iso, .img, .dmg, .gz, .bz2, .xz, .zst)",
                     path.display()
                 ),
             );
@@ -569,8 +578,12 @@ impl BootLiteApp {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "Bootable Disk Images",
-                &["iso", "img", "dmg", "raw", "bin", "gz", "xz", "lzma", "zst"],
+                &[
+                    "iso", "img", "dmg", "raw", "bin", "gz", "gzip", "bz2", "bzip2", "xz",
+                    "lzma", "zst", "zstd",
+                ],
             )
+            .add_filter("All Files (*)", &["*"])
             .pick_file()
         {
             self.set_image(path);
@@ -623,10 +636,147 @@ impl BootLiteApp {
         self.last_hotplug_poll = Instant::now();
     }
 
+    fn start_file_hash_check(&mut self) {
+        let Some(image_path) = self.image_path.clone() else { return };
+        let expected_opt = normalize_sha256_input(&self.expected_sha256);
+
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        let cancel_clone = Arc::clone(&self.cancel_flag);
+        let status_clone = Arc::clone(&self.status);
+        let logs_clone = Arc::clone(&self.logs);
+
+        push_log(
+            &logs_clone,
+            format!("Computing SHA-256 checksum of '{}'...", image_path.display()),
+        );
+
+        *status_clone.lock().unwrap() = JobStatus::Running {
+            phase: "Computing file SHA-256...".into(),
+            progress: 0.0,
+            speed_mbps: 0.0,
+            bytes_done: 0,
+            total_bytes: 1,
+            elapsed_secs: 0,
+            eta_secs: None,
+        };
+
+        thread::spawn(move || {
+            let start = Instant::now();
+            let res = compute_image_sha256(&image_path, Some(&cancel_clone), |prog| {
+                let fraction = (prog.bytes_processed as f32 / prog.total_bytes as f32).clamp(0.0, 1.0);
+                let elapsed_secs = start.elapsed().as_secs();
+                let eta_secs = if prog.speed_mbps > 0.1 && prog.total_bytes > prog.bytes_processed {
+                    let rem_mb = (prog.total_bytes - prog.bytes_processed) as f64 / (1024.0 * 1024.0);
+                    Some((rem_mb / prog.speed_mbps).round() as u64)
+                } else {
+                    None
+                };
+                *status_clone.lock().unwrap() = JobStatus::Running {
+                    phase: prog.phase.to_string(),
+                    progress: fraction,
+                    speed_mbps: prog.speed_mbps,
+                    bytes_done: prog.bytes_processed,
+                    total_bytes: prog.total_bytes,
+                    elapsed_secs,
+                    eta_secs,
+                };
+            });
+
+            match res {
+                Ok(file_hash) => {
+                    push_log(&logs_clone, format!("File SHA-256: {}", file_hash));
+                    if let Some(exp) = expected_opt {
+                        if exp == file_hash {
+                            push_log(
+                                &logs_clone,
+                                "[OK] File SHA-256 matches your expected checksum!",
+                            );
+                            *status_clone.lock().unwrap() = JobStatus::Idle;
+                        } else {
+                            let msg = format!(
+                                "File SHA-256 mismatch! Expected: {}, Actual: {}",
+                                exp, file_hash
+                            );
+                            push_log(&logs_clone, format!("[ERROR] {}", msg));
+                            *status_clone.lock().unwrap() = JobStatus::Error(msg);
+                        }
+                    } else {
+                        push_log(
+                            &logs_clone,
+                            "[OK] File SHA-256 computed (paste a checksum above to compare).",
+                        );
+                        *status_clone.lock().unwrap() = JobStatus::Idle;
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    push_log(&logs_clone, format!("[ERROR] {}", msg));
+                    *status_clone.lock().unwrap() = JobStatus::Error(msg);
+                }
+            }
+        });
+    }
+
+    fn start_reset_drive(&mut self) {
+        let Some(idx) = self.selected_drive_idx else { return };
+        let Some(drive) = self.drives.get(idx).cloned() else { return };
+
+        let status_clone = Arc::clone(&self.status);
+        let logs_clone = Arc::clone(&self.logs);
+
+        push_log(&logs_clone, "────────────────────────────────────────────────────────");
+        push_log(
+            &logs_clone,
+            format!(
+                "RESETTING & FORMATTING USB -> {} ({}) [{}]",
+                drive.model,
+                drive.id,
+                format_bytes(drive.size_bytes)
+            ),
+        );
+
+        *status_clone.lock().unwrap() = JobStatus::Running {
+            phase: format!("Wiping & formatting {} as ExFAT...", drive.id),
+            progress: 0.5,
+            speed_mbps: 0.0,
+            bytes_done: drive.size_bytes / 2,
+            total_bytes: drive.size_bytes,
+            elapsed_secs: 0,
+            eta_secs: None,
+        };
+
+        thread::spawn(move || {
+            let start = Instant::now();
+            match reset_and_format_drive(&drive, "BOOTLITE") {
+                Ok(()) => {
+                    let elapsed = start.elapsed().as_secs();
+                    push_log(
+                        &logs_clone,
+                        format!(
+                            "[OK] Restored {} ({}) to full-capacity ExFAT volume 'BOOTLITE'",
+                            drive.model, drive.id
+                        ),
+                    );
+                    *status_clone.lock().unwrap() = JobStatus::ResetSuccess {
+                        drive_name: format!("{} ({})", drive.model, drive.id),
+                        elapsed_secs: elapsed,
+                    };
+                }
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    push_log(&logs_clone, format!("[ERROR] {}", msg));
+                    *status_clone.lock().unwrap() = JobStatus::Error(msg);
+                }
+            }
+        });
+    }
+
     fn start_flash(&mut self) {
         let Some(image_path) = self.image_path.clone() else { return };
         let Some(idx) = self.selected_drive_idx else { return };
         let Some(drive) = self.drives.get(idx).cloned() else { return };
+        let expected_opt = normalize_sha256_input(&self.expected_sha256);
+        let should_eject = self.auto_eject;
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let cancel_clone = Arc::clone(&self.cancel_flag);
@@ -753,6 +903,34 @@ impl BootLiteApp {
             match result {
                 Ok(hash) => {
                     push_log(&logs_clone, format!("Verified SHA-256: {}", hash));
+                    if let Some(exp) = expected_opt {
+                        if exp != hash {
+                            let err_msg = format!(
+                                "Expected SHA-256 mismatch! Expected: {}, Flashed: {}",
+                                exp, hash
+                            );
+                            push_log(&logs_clone, format!("[ERROR] {}", err_msg));
+                            *status_clone.lock().unwrap() = JobStatus::Error(err_msg);
+                            return;
+                        } else {
+                            push_log(
+                                &logs_clone,
+                                "[OK] Flashed stream matches your expected SHA-256 checksum!",
+                            );
+                        }
+                    }
+
+                    let mut ejected = false;
+                    if should_eject {
+                        if eject_drive(&drive).is_ok() {
+                            ejected = true;
+                            push_log(
+                                &logs_clone,
+                                format!("[OK] Safely powered off & ejected {}", drive.id),
+                            );
+                        }
+                    }
+
                     push_log(
                         &logs_clone,
                         format!(
@@ -763,6 +941,7 @@ impl BootLiteApp {
                     *status_clone.lock().unwrap() = JobStatus::Success {
                         hash,
                         elapsed_secs: total_elapsed,
+                        ejected,
                     };
                 }
                 Err(err) => {
@@ -781,7 +960,6 @@ impl eframe::App for BootLiteApp {
         let is_running = matches!(current_status, JobStatus::Running { .. });
         let is_hovering_file = !is_running && ctx.input(|i| !i.raw.hovered_files.is_empty());
 
-        // Prevent accidental window close while flashing
         if ctx.input(|i| i.viewport().close_requested()) && is_running && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.show_exit_modal = true;
@@ -790,7 +968,6 @@ impl eframe::App for BootLiteApp {
         if is_running {
             ctx.request_repaint();
         } else {
-            // Auto-poll USB hotplug events every 2.5 seconds when idle
             if self.last_hotplug_poll.elapsed() >= Duration::from_millis(2500) {
                 self.refresh_drives(false);
             }
@@ -805,7 +982,7 @@ impl eframe::App for BootLiteApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG_APP).inner_margin(22.0))
+            .frame(egui::Frame::default().fill(BG_APP).inner_margin(20.0))
             .show(ctx, |ui| {
                 // HEADER
                 ui.horizontal(|ui| {
@@ -821,7 +998,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.2.0",
+                                "v0.2.1",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -865,7 +1042,7 @@ impl eframe::App for BootLiteApp {
                     });
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // 3-STAGE PIPELINE STEPPER BAR
                 let step1_done = self.image_path.is_some();
@@ -876,7 +1053,7 @@ impl eframe::App for BootLiteApp {
                     .fill(Color32::from_rgb(15, 21, 36))
                     .stroke(Stroke::new(1.0_f32, BORDER_DIM))
                     .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 7.0))
                     .show(ui, |ui| {
                         ui.columns(3, |cols| {
                             cols[0].horizontal(|ui| {
@@ -930,9 +1107,9 @@ impl eframe::App for BootLiteApp {
                         });
                     });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
-                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD
+                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD + OPTIONAL SHA-256 CHECKSUM BAR
                 let has_img = self.image_path.is_some();
                 let has_warn = self
                     .image_meta
@@ -959,7 +1136,7 @@ impl eframe::App for BootLiteApp {
                     .fill(card1_fill)
                     .stroke(Stroke::new(1.4_f32, card1_border))
                     .rounding(12.0)
-                    .inner_margin(14.0)
+                    .inner_margin(12.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             draw_disc_icon(ui, has_img || is_hovering_file);
@@ -974,7 +1151,7 @@ impl eframe::App for BootLiteApp {
                                             .color(ACCENT_GLOW),
                                     );
                                     ui.label(
-                                        RichText::new("Supports .iso, .img, .dmg, .gz, .xz, and .zst")
+                                        RichText::new("Supports .iso, .img, .dmg, .gz, .bz2, .xz, and .zst")
                                             .size(12.0)
                                             .color(TEXT_MAIN),
                                     );
@@ -1038,7 +1215,7 @@ impl eframe::App for BootLiteApp {
                                                         .size(12.0)
                                                         .color(TEXT_SUB),
                                                 );
-                                                for ext in ["ISO", "IMG", "DMG", "GZ", "XZ", "ZST"] {
+                                                for ext in ["ISO", "IMG", "DMG", "GZ", "BZ2", "XZ", "ZST"] {
                                                     draw_pill(
                                                         ui,
                                                         ext,
@@ -1068,7 +1245,7 @@ impl eframe::App for BootLiteApp {
                                     )
                                     .fill(btn_fill)
                                     .rounding(8.0)
-                                    .min_size(Vec2::new(118.0, 34.0));
+                                    .min_size(Vec2::new(115.0, 34.0));
 
                                     let resp = ui.add(btn);
                                     if resp.hovered() {
@@ -1080,11 +1257,36 @@ impl eframe::App for BootLiteApp {
                                 });
                             });
                         });
+
+                        if has_img {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Expected SHA-256:")
+                                        .size(11.0)
+                                        .color(TEXT_SUB),
+                                );
+                                let edit = egui::TextEdit::singleline(&mut self.expected_sha256)
+                                    .hint_text("Optional: paste official SHA-256 checksum to verify image...")
+                                    .desired_width(330.0)
+                                    .font(egui::TextStyle::Monospace);
+                                ui.add_enabled(!is_running, edit);
+
+                                ui.add_enabled_ui(!is_running, |ui| {
+                                    if !self.expected_sha256.is_empty() && ui.small_button("Clear").clicked() {
+                                        self.expected_sha256.clear();
+                                    }
+                                    if ui.small_button("Check File Hash").clicked() {
+                                        self.start_file_hash_check();
+                                    }
+                                });
+                            });
+                        }
                     });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
-                // STEP 2: TARGET USB DRIVE SELECTOR CARD
+                // STEP 2: TARGET USB DRIVE SELECTOR CARD + RESET / FORMAT USB UTILITY
                 let is_compressed = self
                     .image_meta
                     .as_ref()
@@ -1095,11 +1297,11 @@ impl eframe::App for BootLiteApp {
                     .fill(BG_CARD)
                     .stroke(Stroke::new(1.2_f32, BORDER_DIM))
                     .rounding(12.0)
-                    .inner_margin(14.0)
+                    .inner_margin(12.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new("TARGET DESTINATION DRIVE (AUTO-HOTPLUG ACTIVE)")
+                                RichText::new("TARGET DESTINATION DRIVE (AUTO-HOTPLUG)")
                                     .size(11.0)
                                     .strong()
                                     .color(TEXT_SUB),
@@ -1107,40 +1309,59 @@ impl eframe::App for BootLiteApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_enabled_ui(!is_running, |ui| {
                                     let refresh_btn = egui::Button::new(
-                                        RichText::new("Rescan Drives").size(11.5).color(TEXT_MAIN),
+                                        RichText::new("Rescan").size(11.5).color(TEXT_MAIN),
                                     )
                                     .fill(Color32::from_rgb(30, 41, 59))
                                     .rounding(6.0);
 
-                                    let r_resp = ui.add(refresh_btn);
-                                    if r_resp.hovered() {
-                                        ctx.set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    if r_resp.clicked() {
+                                    if ui.add(refresh_btn).clicked() {
                                         self.refresh_drives(true);
                                     }
 
-                                    ui.add_space(8.0);
+                                    if self.selected_drive_idx.is_some() && !self.drives.is_empty() {
+                                        let reset_btn = egui::Button::new(
+                                            RichText::new("Reset / Format USB")
+                                                .size(11.5)
+                                                .color(ACCENT_GLOW),
+                                        )
+                                        .fill(Color32::from_rgb(23, 37, 84))
+                                        .rounding(6.0);
+
+                                        if ui.add(reset_btn).clicked() {
+                                            if !self.has_root {
+                                                if let Err(e) =
+                                                    relaunch_elevated(self.image_path.as_ref())
+                                                {
+                                                    *self.status.lock().unwrap() =
+                                                        JobStatus::Error(e.to_string());
+                                                }
+                                            } else {
+                                                self.show_reset_modal = true;
+                                            }
+                                        }
+                                    }
+
+                                    ui.add_space(4.0);
                                     if draw_toggle_switch(ui, &mut self.allow_virtual).changed() {
                                         self.refresh_drives(true);
                                     }
                                     ui.label(
                                         RichText::new("Virtual Disks")
-                                            .size(11.5)
+                                            .size(11.0)
                                             .color(TEXT_SUB),
                                     );
                                 });
                             });
                         });
 
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
 
                         if self.drives.is_empty() {
                             egui::Frame::default()
                                 .fill(BG_APP)
                                 .stroke(Stroke::new(1.0_f32, BORDER_DIM))
                                 .rounding(10.0)
-                                .inner_margin(14.0)
+                                .inner_margin(12.0)
                                 .show(ui, |ui| {
                                     ui.vertical_centered(|ui| {
                                         ui.label(
@@ -1161,7 +1382,7 @@ impl eframe::App for BootLiteApp {
                         } else {
                             egui::ScrollArea::vertical()
                                 .id_salt("drives_scroll")
-                                .max_height(105.0)
+                                .max_height(100.0)
                                 .show(ui, |ui| {
                                     for (idx, d) in self.drives.iter().enumerate() {
                                         let is_selected = self.selected_drive_idx == Some(idx);
@@ -1187,7 +1408,7 @@ impl eframe::App for BootLiteApp {
                                             .fill(fill)
                                             .stroke(Stroke::new(1.5_f32, border))
                                             .rounding(10.0)
-                                            .inner_margin(10.0)
+                                            .inner_margin(9.0)
                                             .show(ui, |ui| {
                                                 ui.horizontal(|ui| {
                                                     draw_usb_icon(ui, is_selected);
@@ -1271,9 +1492,9 @@ impl eframe::App for BootLiteApp {
                         }
                     });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
-                // STEP 3: ACTION BAR & LIVE TELEMETRY WITH ETA
+                // STEP 3: ACTION BAR, AUTO-EJECT TOGGLE & LIVE TELEMETRY
                 let selected_drive_valid = self
                     .selected_drive_idx
                     .and_then(|idx| self.drives.get(idx))
@@ -1296,13 +1517,13 @@ impl eframe::App for BootLiteApp {
                 match current_status {
                     JobStatus::Idle => {
                         ui.horizontal(|ui| {
+                            draw_toggle_switch(ui, &mut self.auto_eject);
                             ui.label(
-                                RichText::new(
-                                    "Unbuffered raw I/O + Backup GPT wipe + SHA-256 hardware read-back",
-                                )
-                                .size(11.5)
-                                .color(TEXT_DIM),
+                                RichText::new("Auto-Eject on Finish")
+                                    .size(12.0)
+                                    .color(TEXT_SUB),
                             );
+
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_enabled_ui(can_flash, |ui| {
                                     let fill = if can_flash {
@@ -1422,7 +1643,11 @@ impl eframe::App for BootLiteApp {
                                 );
                             });
                     }
-                    JobStatus::Success { hash, elapsed_secs } => {
+                    JobStatus::Success {
+                        hash,
+                        elapsed_secs,
+                        ejected,
+                    } => {
                         egui::Frame::default()
                             .fill(Color32::from_rgb(6, 46, 34))
                             .stroke(Stroke::new(1.2_f32, ACCENT_SUCCESS))
@@ -1436,10 +1661,12 @@ impl eframe::App for BootLiteApp {
                                         Color32::from_rgb(6, 78, 59),
                                         ACCENT_SUCCESS,
                                     );
+                                    let suffix = if ejected { " — Safely Ejected" } else { "" };
                                     ui.label(
                                         RichText::new(format!(
-                                            "Flash & Hardware SHA-256 Read-Back Complete ({})",
-                                            format_duration(elapsed_secs)
+                                            "Flash & SHA-256 Read-Back Complete ({}){}",
+                                            format_duration(elapsed_secs),
+                                            suffix
                                         ))
                                         .size(13.0)
                                         .strong()
@@ -1463,6 +1690,44 @@ impl eframe::App for BootLiteApp {
                                         .size(11.0)
                                         .color(TEXT_MAIN),
                                 );
+                            });
+                    }
+                    JobStatus::ResetSuccess {
+                        drive_name,
+                        elapsed_secs,
+                    } => {
+                        egui::Frame::default()
+                            .fill(Color32::from_rgb(6, 46, 34))
+                            .stroke(Stroke::new(1.2_f32, ACCENT_SUCCESS))
+                            .rounding(10.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    draw_pill(
+                                        ui,
+                                        "RESTORED",
+                                        Color32::from_rgb(6, 78, 59),
+                                        ACCENT_SUCCESS,
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} formatted as full-capacity ExFAT ({})",
+                                            drive_name,
+                                            format_duration(elapsed_secs)
+                                        ))
+                                        .size(13.0)
+                                        .strong()
+                                        .color(ACCENT_SUCCESS),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("Done").clicked() {
+                                                *self.status.lock().unwrap() = JobStatus::Idle;
+                                            }
+                                        },
+                                    );
+                                });
                             });
                     }
                     JobStatus::Error(err) => {
@@ -1497,7 +1762,7 @@ impl eframe::App for BootLiteApp {
                     }
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
                 // RUFUS-STYLE BEHIND-THE-SCENES LIVE ENGINE LOG CONSOLE
                 ui.horizontal(|ui| {
@@ -1536,8 +1801,8 @@ impl eframe::App for BootLiteApp {
                             ui.set_width(ui.available_width());
                             egui::ScrollArea::vertical()
                                 .id_salt("rufus_log_console")
-                                .max_height(135.0)
-                                .min_scrolled_height(135.0)
+                                .max_height(130.0)
+                                .min_scrolled_height(130.0)
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
@@ -1551,6 +1816,7 @@ impl eframe::App for BootLiteApp {
                                             ACCENT_WARN
                                         } else if line.contains("STARTING FLASH JOB")
                                             || line.contains("Verified SHA-256")
+                                            || line.contains("RESETTING & FORMATTING")
                                         {
                                             ACCENT_GLOW
                                         } else {
@@ -1563,7 +1829,7 @@ impl eframe::App for BootLiteApp {
                 }
             });
 
-        // SAFETY CONFIRMATION MODAL
+        // SAFETY CONFIRMATION MODAL (FLASH)
         if self.show_confirm_modal {
             egui::Window::new("Confirm Target Drive Erase")
                 .collapsible(false)
@@ -1608,6 +1874,58 @@ impl eframe::App for BootLiteApp {
                         }
                         if ui.button("Cancel").clicked() {
                             self.show_confirm_modal = false;
+                        }
+                    });
+                });
+        }
+
+        // RESET / FORMAT USB MODAL
+        if self.show_reset_modal {
+            egui::Window::new("Reset & Format USB Drive to ExFAT")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    if let Some(idx) = self.selected_drive_idx {
+                        if let Some(d) = self.drives.get(idx) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Restore {} ({}) [{}] to full capacity?",
+                                    d.model,
+                                    d.id,
+                                    format_bytes(d.size_bytes)
+                                ))
+                                .size(14.0)
+                                .strong()
+                                .color(TEXT_MAIN),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "This wipes all MBR, GPT, and Backup GPT boot tables and formats the drive as a clean ExFAT volume.",
+                                )
+                                .size(12.0)
+                                .color(ACCENT_WARN),
+                            );
+                        }
+                    }
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        let fmt_btn = egui::Button::new(
+                            RichText::new("Wipe & Format ExFAT")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_PRIMARY)
+                        .rounding(7.0);
+
+                        if ui.add(fmt_btn).clicked() {
+                            self.show_reset_modal = false;
+                            self.start_reset_drive();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_reset_modal = false;
                         }
                     });
                 });

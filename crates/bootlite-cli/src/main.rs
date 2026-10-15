@@ -1,11 +1,18 @@
-use anyhow::Result;
-use bootlite_core::{flash_and_verify, list_safe_usb_drives};
+use anyhow::{Context, Result};
+use bootlite_core::{
+    eject_drive, flash_and_verify, inspect_image, list_safe_usb_drives, normalize_sha256_input,
+    reset_and_format_drive,
+};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "bootlite", version, about = "Fast, zero-bloat cross-platform USB image flasher")]
+#[command(
+    name = "bootlite-cli",
+    version = "0.2.1",
+    about = "Raw Hardware USB Flasher & SHA-256 Verifier"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -13,21 +20,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List safe removable USB drives
+    /// List connected removable USB / SD drives
     List {
-        /// Include attached virtual disk images for safe testing
-        #[arg(long)]
-        allow_virtual: bool,
+        #[arg(long, help = "Include virtual / loopback disks")]
+        virtual_disks: bool,
     },
-    /// Flash and verify an ISO/IMG file onto a removable drive
-    Flash {
-        /// Path to the source .iso or .img file
+    /// Inspect an OS image for boot signatures, partition tables, and compression
+    Inspect {
+        #[arg(short, long)]
         image: PathBuf,
-        /// Target disk ID (e.g., disk4 on macOS, sdb on Linux, PhysicalDrive1 on Windows)
-        disk_id: String,
-        /// Allow flashing to a virtual test drive
-        #[arg(long)]
-        allow_virtual: bool,
+    },
+    /// Flash and hardware-verify an image to a target USB drive
+    Flash {
+        #[arg(short, long)]
+        image: PathBuf,
+        #[arg(short, long, help = "Target drive ID (e.g., disk2, sdb, PhysicalDrive1)")]
+        drive: String,
+        #[arg(long, help = "Optional expected SHA-256 hash to verify against")]
+        expected_sha256: Option<String>,
+        #[arg(long, help = "Automatically eject the USB drive after verification")]
+        eject: bool,
+        #[arg(long, help = "Allow flashing to virtual disks")]
+        virtual_disks: bool,
+    },
+    /// Wipe MBR/GPT/Backup-GPT and format a USB drive back to full-capacity ExFAT
+    Reset {
+        #[arg(short, long, help = "Target drive ID (e.g., disk2, sdb, PhysicalDrive1)")]
+        drive: String,
+        #[arg(long, default_value = "BOOTLITE", help = "Volume label")]
+        label: String,
+        #[arg(long, help = "Allow resetting virtual disks")]
+        virtual_disks: bool,
     },
 }
 
@@ -35,80 +58,104 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::List { allow_virtual } => {
-            let drives = list_safe_usb_drives(allow_virtual)?;
+        Commands::List { virtual_disks } => {
+            let drives = list_safe_usb_drives(virtual_disks)?;
             if drives.is_empty() {
-                println!("No removable USB drives detected.");
-                println!("Tip: Pass --allow-virtual to see attached virtual test disks.");
-                return Ok(());
+                println!("No removable USB / SD drives detected.");
+            } else {
+                for d in drives {
+                    let gb = d.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    println!(
+                        "{:<16} {:<28} {:>7.2} GB   Bus: {:<9} Node: {}",
+                        d.id,
+                        d.model,
+                        gb,
+                        d.bus,
+                        d.raw_device_path.display()
+                    );
+                }
             }
-
-            println!(
-                "{:<14} {:<20} {:<10} {:<14} {}",
-                "ID", "RAW PATH", "SIZE", "BUS", "MODEL"
-            );
-            println!("{}", "-".repeat(75));
-            for d in drives {
-                let mb = d.size_bytes as f64 / (1024.0 * 1024.0);
-                let size_str = if mb >= 1024.0 {
-                    format!("{:.2} GB", mb / 1024.0)
-                } else {
-                    format!("{:.0} MB", mb)
-                };
-                println!(
-                    "{:<14} {:<20} {:>10} {:<14} {}",
-                    d.id,
-                    d.raw_device_path.display(),
-                    size_str,
-                    d.bus,
-                    d.model
-                );
+        }
+        Commands::Inspect { image } => {
+            let meta = inspect_image(&image)?;
+            let mb = meta.file_size as f64 / (1024.0 * 1024.0);
+            println!("File:        {}", image.display());
+            println!("Size:        {:.2} MB ({} bytes)", mb, meta.file_size);
+            println!("Stream Mode: {}", meta.compression);
+            println!("Boot Layout: {}", meta.scheme);
+            if let Some(warn) = meta.warning {
+                println!("WARNING:     {}", warn);
             }
         }
         Commands::Flash {
             image,
-            disk_id,
-            allow_virtual,
+            drive,
+            expected_sha256,
+            eject,
+            virtual_disks,
         } => {
-            let clean_id = disk_id
-                .trim_start_matches("/dev/r")
-                .trim_start_matches("/dev/");
+            let meta = inspect_image(&image)?;
+            println!("Image Layout: {} ({})", meta.scheme, meta.compression);
+            if let Some(warn) = &meta.warning {
+                eprintln!("WARNING: {}", warn);
+            }
 
-            let drives = list_safe_usb_drives(allow_virtual)?;
+            let drives = list_safe_usb_drives(virtual_disks)?;
             let target = drives
                 .into_iter()
-                .find(|d| d.id == clean_id || d.raw_device_path.to_string_lossy() == disk_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Drive '{}' not found or blocked by safety checks! (If testing a virtual disk, pass --allow-virtual)",
-                        disk_id
-                    )
-                })?;
-
-            println!(
-                "Flashing '{}' -> {} ({})",
-                image.display(),
-                target.raw_device_path.display(),
-                target.model
-            );
+                .find(|d| d.id == drive)
+                .with_context(|| format!("Target drive '{}' not found or locked for safety", drive))?;
 
             let pb = ProgressBar::new(100);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({msg})",
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
                 )?
                 .progress_chars("#>-"),
             );
 
-            let hash = flash_and_verify(&image, &target, None, |p| {
-                pb.set_length(p.total_bytes);
-                pb.set_position(p.bytes_processed);
-                pb.set_message(format!("{}: {:.1} MB/s", p.phase, p.speed_mbps));
+            let hash = flash_and_verify(&image, &target, None, |prog| {
+                pb.set_length(prog.total_bytes);
+                pb.set_position(prog.bytes_processed);
+                pb.set_message(format!("{} ({:.1} MB/s)", prog.phase, prog.speed_mbps));
             })?;
+            pb.finish_with_message("Verified!");
 
-            pb.finish_with_message("Done!");
-            println!("\nFlash & Read-Back Verification Successful!");
-            println!("Verified SHA-256: {}", hash);
+            println!("Hardware SHA-256: {}", hash);
+            if let Some(exp_raw) = expected_sha256 {
+                if let Some(exp) = normalize_sha256_input(&exp_raw) {
+                    if exp != hash {
+                        anyhow::bail!(
+                            "Expected SHA-256 mismatch! Expected: {}, Flashed: {}",
+                            exp,
+                            hash
+                        );
+                    }
+                    println!("Expected SHA-256 matched!");
+                }
+            }
+
+            if eject {
+                eject_drive(&target)?;
+                println!("Safely ejected {}.", target.id);
+            }
+        }
+        Commands::Reset {
+            drive,
+            label,
+            virtual_disks,
+        } => {
+            let drives = list_safe_usb_drives(virtual_disks)?;
+            let target = drives
+                .into_iter()
+                .find(|d| d.id == drive)
+                .with_context(|| format!("Target drive '{}' not found or locked for safety", drive))?;
+            println!(
+                "Wiping partition tables and formatting {} ({}) as ExFAT [{}]...",
+                target.model, target.id, label
+            );
+            reset_and_format_drive(&target, &label)?;
+            println!("Drive {} successfully restored to full capacity.", target.id);
         }
     }
 

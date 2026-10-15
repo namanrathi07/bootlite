@@ -197,9 +197,6 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
             )
         })?;
 
-    // Acquire exclusive BSD lock on the block device descriptor.
-    // Per systemd Block Device Locking specification, this inhibits systemd-udevd
-    // and udisks2 from probing or auto-mounting partitions while BootLite is flashing.
     unsafe {
         let _ = libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
     }
@@ -226,4 +223,56 @@ pub fn finish_device(file: Option<File>) {
             let _ = libc::ioctl(fd, BLKRRPART as _, 0);
         }
     }
+}
+
+pub fn eject_drive(drive: &UsbDrive) -> Result<()> {
+    if drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to eject system drive");
+    }
+    let _ = unmount_drive(drive);
+    let dev_path = format!("/dev/{}", drive.id);
+    let ok = Command::new("udisksctl")
+        .args(["power-off", "-b", &dev_path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = Command::new("eject").arg(&dev_path).status();
+    }
+    Ok(())
+}
+
+pub fn format_drive_exfat(drive: &UsbDrive, label: &str) -> Result<()> {
+    if drive.is_system {
+        anyhow::bail!("Safety lock: Refusing to format system drive");
+    }
+    let dev = format!("/dev/{}", drive.id);
+    let _ = Command::new("parted")
+        .args([
+            "-s", &dev, "mklabel", "msdos", "mkpart", "primary", "ntfs", "1MiB", "100%",
+        ])
+        .status();
+
+    let part = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
+        format!("/dev/{}p1", drive.id)
+    } else {
+        format!("/dev/{}1", drive.id)
+    };
+
+    let exfat_ok = Command::new("mkfs.exfat")
+        .args(["-n", label, &part])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !exfat_ok {
+        let status = Command::new("mkfs.vfat")
+            .args(["-F", "32", "-n", label, &part])
+            .status()
+            .context("Failed to format partition (install exfatprogs or dosfstools)")?;
+        if !status.success() {
+            anyhow::bail!("Failed to format {} as ExFAT or FAT32", part);
+        }
+    }
+    Ok(())
 }

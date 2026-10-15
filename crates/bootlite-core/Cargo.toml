@@ -1,10 +1,11 @@
 [package]
 name = "bootlite-core"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
 anyhow.workspace = true
+bzip2-rs.workspace = true
 flate2.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
