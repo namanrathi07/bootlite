@@ -4,7 +4,7 @@
 
 *Built in 100% Native Rust (`bootlite-core`, `bootlite-gui`, `bootlite-cli`) for macOS, Windows, and Linux.*
 
-[![Release](https://img.shields.io/github/v/release/NR3009/bootlite?style=flat-square&color=blue)](https://github.com/NR3009/bootlite/releases/latest)
+[![Release](https://img.shields.io/badge/release-v0.4.1-3b82f6?style=flat-square)](https://github.com/NR3009/bootlite/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=flat-square)](#download-pre-built-binaries)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
