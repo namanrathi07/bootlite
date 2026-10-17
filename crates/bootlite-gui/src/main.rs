@@ -32,6 +32,7 @@ const TEXT_DIM: Color32 = Color32::from_rgb(100, 116, 139);
 enum UnattendTab {
     Basic,
     Advanced,
+    AutoPilot,
     XmlPreview,
 }
 
@@ -246,6 +247,18 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars || max_chars < 12 {
+        return text.to_string();
+    }
+    let head = (max_chars - 3) / 2;
+    let tail = max_chars - 3 - head;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{}...{}", start, end)
+}
+
 fn now_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -293,7 +306,7 @@ fn draw_brand_logo(ui: &mut egui::Ui) {
 }
 
 fn draw_disc_icon(ui: &mut egui::Ui, active: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
     let p = ui.painter();
     let tint = if active {
         Color32::from_rgb(30, 58, 138)
@@ -309,7 +322,7 @@ fn draw_disc_icon(ui: &mut egui::Ui, active: bool) {
 }
 
 fn draw_usb_icon(ui: &mut egui::Ui, active: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(38.0, 38.0), Sense::hover());
     let p = ui.painter();
     let tint = if active {
         Color32::from_rgb(30, 58, 138)
@@ -425,8 +438,9 @@ fn build_window_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([710.0, 760.0])
-            .with_resizable(false)
+            .with_inner_size([740.0, 770.0])
+            .with_min_inner_size([660.0, 640.0])
+            .with_resizable(true)
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(build_window_icon())),
         ..Default::default()
@@ -437,8 +451,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = Vec2::new(8.0, 6.5);
-            style.spacing.button_padding = Vec2::new(10.0, 5.5);
+            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            style.spacing.button_padding = Vec2::new(10.0, 5.0);
             let mut visuals = egui::Visuals::dark();
             visuals.panel_fill = BG_APP;
             visuals.window_fill = BG_CARD;
@@ -512,7 +526,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.5.1 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.0 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -594,7 +608,7 @@ impl BootLiteApp {
                 if meta.is_windows_udf_iso {
                     push_log(
                         &self.logs,
-                        "Windows 10/11 ISO detected -> 'Customize Windows Setup (Unattended)' Studio unlocked",
+                        "Windows 10/11 ISO detected -> AutoPilot Hardware Hash Extractor (\\AutoPilot\\) & Unattended Setup Studio ready",
                     );
                 }
                 if let Some(warn) = &meta.warning {
@@ -843,11 +857,17 @@ impl BootLiteApp {
                 vmode.label()
             ),
         );
-        if unattend_cfg.enabled {
+        if unattend_cfg.extract_autopilot_hash {
+            push_log(
+                &logs_clone,
+                "AutoPilot Hash Extractor ACTIVE -> Provisioning \\AutoPilot\\Extract-AutoPilotHash.ps1 on USB",
+            );
+        }
+        if unattend_cfg.should_inject_unattend() {
             push_log(
                 &logs_clone,
                 format!(
-                    "Unattended Windows Setup ACTIVE -> Injecting autounattend.xml ({} tweaks enabled)",
+                    "Unattended Windows Setup ACTIVE -> Injecting autounattend.xml ({} features enabled)",
                     unattend_cfg.active_tweak_count()
                 ),
             );
@@ -1025,7 +1045,7 @@ impl eframe::App for BootLiteApp {
             .unwrap_or(false);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG_APP).inner_margin(18.0))
+            .frame(egui::Frame::default().fill(BG_APP).inner_margin(16.0))
             .show(ctx, |ui| {
                 // HEADER
                 ui.horizontal(|ui| {
@@ -1041,14 +1061,14 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.5.1",
+                                "v0.6.0",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
                         });
                         ui.label(
                             RichText::new(
-                                "Cross-Platform Raw USB Flasher, Windows 10/11 Studio & Verifier",
+                                "Cross-Platform Raw USB Flasher, Windows 10/11 & AutoPilot Studio",
                             )
                             .size(11.5)
                             .color(TEXT_SUB),
@@ -1087,7 +1107,7 @@ impl eframe::App for BootLiteApp {
                     });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
                 // 3-STAGE PIPELINE STEPPER BAR
                 let step1_done = self.image_path.is_some();
@@ -1098,7 +1118,7 @@ impl eframe::App for BootLiteApp {
                     .fill(Color32::from_rgb(15, 21, 36))
                     .stroke(Stroke::new(1.0_f32, BORDER_DIM))
                     .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(14.0, 6.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 5.0))
                     .show(ui, |ui| {
                         ui.columns(3, |cols| {
                             cols[0].horizontal(|ui| {
@@ -1152,9 +1172,9 @@ impl eframe::App for BootLiteApp {
                         });
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD + SHA-256 BAR + WINDOWS UNATTENDED BUTTON
+                // STEP 1: RESPONSIVE IMAGE DROPZONE CARD (MULTI-ROW SO BADGES & BUTTONS NEVER COLLIDE)
                 let has_img = self.image_path.is_some();
                 let has_warn = self
                     .image_meta
@@ -1181,98 +1201,89 @@ impl eframe::App for BootLiteApp {
                     .fill(card1_fill)
                     .stroke(Stroke::new(1.4_f32, card1_border))
                     .rounding(11.0)
-                    .inner_margin(11.0)
+                    .inner_margin(10.0)
                     .show(ui, |ui| {
+                        // Row 1: Icon + Filename/Path (Left) and Browse/Change Button (Right)
                         ui.horizontal(|ui| {
                             draw_disc_icon(ui, has_img || is_hovering_file);
-                            ui.add_space(6.0);
+                            ui.add_space(4.0);
 
-                            ui.vertical(|ui| {
-                                if is_hovering_file {
-                                    ui.label(
-                                        RichText::new("Release Mouse to Load Bootable Disk Image")
-                                            .size(14.0)
-                                            .strong()
-                                            .color(ACCENT_GLOW),
-                                    );
-                                    ui.label(
-                                        RichText::new("Supports .iso, .img, .dmg, .gz, .bz2, .xz, and .zst")
-                                            .size(12.0)
-                                            .color(TEXT_MAIN),
-                                    );
-                                } else {
-                                    match &self.image_path {
-                                        Some(p) => {
-                                            let name = p
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().to_string())
-                                                .unwrap_or_else(|| p.display().to_string());
-                                            ui.horizontal(|ui| {
+                            let text_col_w = (ui.available_width() - 125.0).max(200.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(text_col_w, 38.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    if is_hovering_file {
+                                        ui.label(
+                                            RichText::new("Release Mouse to Load Bootable Disk Image")
+                                                .size(13.5)
+                                                .strong()
+                                                .color(ACCENT_GLOW),
+                                        );
+                                        ui.label(
+                                            RichText::new("Supports .iso, .img, .dmg, .gz, .bz2, .xz, and .zst")
+                                                .size(11.5)
+                                                .color(TEXT_MAIN),
+                                        );
+                                    } else {
+                                        match &self.image_path {
+                                            Some(p) => {
+                                                let name = p
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    .unwrap_or_else(|| p.display().to_string());
                                                 ui.label(
-                                                    RichText::new(name)
+                                                    RichText::new(truncate_middle(&name, 52))
                                                         .size(13.5)
                                                         .strong()
                                                         .color(TEXT_MAIN),
                                                 );
-                                                draw_pill(
-                                                    ui,
-                                                    &format_bytes(self.image_size),
-                                                    Color32::from_rgb(30, 58, 138),
-                                                    ACCENT_GLOW,
-                                                );
-                                                if let Some(meta) = &self.image_meta {
-                                                    let (bg, fg) = if meta.warning.is_some() {
-                                                        (Color32::from_rgb(69, 26, 3), ACCENT_WARN)
-                                                    } else {
-                                                        (Color32::from_rgb(6, 78, 59), ACCENT_SUCCESS)
-                                                    };
-                                                    draw_pill(ui, &meta.scheme, bg, fg);
-                                                }
-                                            });
-                                            if let Some(warn) = self
-                                                .image_meta
-                                                .as_ref()
-                                                .and_then(|m| m.warning.as_ref())
-                                            {
-                                                ui.label(
-                                                    RichText::new(warn)
-                                                        .size(11.0)
-                                                        .color(ACCENT_WARN),
-                                                );
-                                            } else {
-                                                ui.label(
-                                                    RichText::new(p.display().to_string())
-                                                        .size(11.0)
-                                                        .color(TEXT_SUB),
-                                                );
-                                            }
-                                        }
-                                        None => {
-                                            ui.label(
-                                                RichText::new("Select Bootable OS Image")
-                                                    .size(14.0)
-                                                    .strong()
-                                                    .color(TEXT_MAIN),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new("Drag & drop or browse")
-                                                        .size(12.0)
-                                                        .color(TEXT_SUB),
-                                                );
-                                                for ext in ["ISO", "IMG", "DMG", "GZ", "BZ2", "XZ", "ZST"] {
-                                                    draw_pill(
-                                                        ui,
-                                                        ext,
-                                                        Color32::from_rgb(30, 41, 59),
-                                                        TEXT_SUB,
+                                                if let Some(warn) = self
+                                                    .image_meta
+                                                    .as_ref()
+                                                    .and_then(|m| m.warning.as_ref())
+                                                {
+                                                    ui.label(
+                                                        RichText::new(truncate_middle(warn, 74))
+                                                            .size(11.0)
+                                                            .color(ACCENT_WARN),
+                                                    );
+                                                } else {
+                                                    let full_p = p.display().to_string();
+                                                    ui.label(
+                                                        RichText::new(truncate_middle(&full_p, 68))
+                                                            .size(11.0)
+                                                            .color(TEXT_SUB),
                                                     );
                                                 }
-                                            });
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    RichText::new("Select Bootable OS Image")
+                                                        .size(14.0)
+                                                        .strong()
+                                                        .color(TEXT_MAIN),
+                                                );
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.label(
+                                                        RichText::new("Drag & drop or browse")
+                                                            .size(11.5)
+                                                            .color(TEXT_SUB),
+                                                    );
+                                                    for ext in ["ISO", "IMG", "DMG", "GZ", "BZ2", "XZ", "ZST"] {
+                                                        draw_pill(
+                                                            ui,
+                                                            ext,
+                                                            Color32::from_rgb(30, 41, 59),
+                                                            TEXT_SUB,
+                                                        );
+                                                    }
+                                                });
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_enabled_ui(!is_running, |ui| {
@@ -1284,13 +1295,13 @@ impl eframe::App for BootLiteApp {
                                     };
                                     let btn = egui::Button::new(
                                         RichText::new(label)
-                                            .size(13.0)
+                                            .size(12.5)
                                             .strong()
                                             .color(Color32::WHITE),
                                     )
                                     .fill(btn_fill)
                                     .rounding(8.0)
-                                    .min_size(Vec2::new(112.0, 34.0));
+                                    .min_size(Vec2::new(110.0, 34.0));
 
                                     let resp = ui.add(btn);
                                     if resp.hovered() {
@@ -1304,87 +1315,127 @@ impl eframe::App for BootLiteApp {
                         });
 
                         if has_img {
-                            ui.add_space(5.0);
+                            // Row 2: Wrapped Image Metadata Pills (Never collides with Change File button)
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                draw_pill(
+                                    ui,
+                                    &format_bytes(self.image_size),
+                                    Color32::from_rgb(30, 58, 138),
+                                    ACCENT_GLOW,
+                                );
+                                if let Some(meta) = &self.image_meta {
+                                    let (bg, fg) = if meta.warning.is_some() {
+                                        (Color32::from_rgb(69, 26, 3), ACCENT_WARN)
+                                    } else {
+                                        (Color32::from_rgb(6, 78, 59), ACCENT_SUCCESS)
+                                    };
+                                    draw_pill(ui, &meta.scheme, bg, fg);
+                                    draw_pill(
+                                        ui,
+                                        meta.compression,
+                                        Color32::from_rgb(30, 41, 59),
+                                        TEXT_SUB,
+                                    );
+                                }
+                                if is_win_iso && self.unattend_config.extract_autopilot_hash {
+                                    draw_pill(
+                                        ui,
+                                        "AutoPilot Hash -> USB \\AutoPilot\\",
+                                        Color32::from_rgb(6, 78, 59),
+                                        ACCENT_SUCCESS,
+                                    );
+                                }
+                            });
+
+                            // Row 3: Expected SHA-256 Checksum Bar (Responsive width)
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new("Expected SHA-256:")
                                         .size(11.0)
                                         .color(TEXT_SUB),
                                 );
+                                let input_w = (ui.available_width() - 150.0).max(160.0);
                                 let edit = egui::TextEdit::singleline(&mut self.expected_sha256)
-                                    .hint_text("Optional: paste official SHA-256 checksum...")
-                                    .desired_width(if is_win_iso { 205.0 } else { 340.0 })
+                                    .hint_text("Optional: paste official SHA-256 checksum to verify...")
+                                    .desired_width(input_w)
                                     .font(egui::TextStyle::Monospace);
                                 ui.add_enabled(!is_running, edit);
 
                                 ui.add_enabled_ui(!is_running, |ui| {
+                                    if small_slate_button(ui, "Check Hash").clicked() {
+                                        self.start_file_hash_check();
+                                    }
                                     if !self.expected_sha256.is_empty()
                                         && small_slate_button(ui, "Clear").clicked()
                                     {
                                         self.expected_sha256.clear();
                                     }
-                                    if small_slate_button(ui, "Check Hash").clicked() {
-                                        self.start_file_hash_check();
-                                    }
-
-                                    // WINDOWS-ISO-ONLY UNATTENDED SETUP STUDIO BUTTON
-                                    if is_win_iso {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let active_cnt =
-                                                    self.unattend_config.active_tweak_count();
-                                                let btn_lbl = if active_cnt > 0 {
-                                                    format!(
-                                                        "Windows Setup Studio ({} Tweaks)",
-                                                        active_cnt
-                                                    )
-                                                } else {
-                                                    "Customize Windows Setup...".to_string()
-                                                };
-                                                let ubtn = egui::Button::new(
-                                                    RichText::new(btn_lbl)
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(if active_cnt > 0 {
-                                                            ACCENT_SUCCESS
-                                                        } else {
-                                                            ACCENT_GLOW
-                                                        }),
-                                                )
-                                                .fill(if active_cnt > 0 {
-                                                    Color32::from_rgb(6, 62, 46)
-                                                } else {
-                                                    Color32::from_rgb(23, 37, 84)
-                                                })
-                                                .stroke(Stroke::new(
-                                                    1.0_f32,
-                                                    if active_cnt > 0 {
-                                                        ACCENT_SUCCESS
-                                                    } else {
-                                                        ACCENT_PRIMARY
-                                                    },
-                                                ))
-                                                .rounding(6.0);
-
-                                                let resp = ui.add(ubtn);
-                                                if resp.hovered() {
-                                                    ctx.set_cursor_icon(CursorIcon::PointingHand);
-                                                }
-                                                if resp.clicked() {
-                                                    self.show_unattend_modal = true;
-                                                }
-                                            },
-                                        );
-                                    }
                                 });
                             });
+
+                            // Row 4 (Windows 10/11 ISO Only): Dedicated AutoPilot & Unattended Setup Bar
+                            if is_win_iso {
+                                ui.add_space(4.0);
+                                egui::Frame::default()
+                                    .fill(Color32::from_rgb(15, 23, 42))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(37, 99, 235)))
+                                    .rounding(7.0)
+                                    .inner_margin(egui::Margin::symmetric(9.0, 5.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.add_enabled_ui(!is_running, |ui| {
+                                                ui.checkbox(
+                                                    &mut self.unattend_config.extract_autopilot_hash,
+                                                    RichText::new("Extract Laptop AutoPilot Hash to USB (\\AutoPilot\\)")
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(TEXT_MAIN),
+                                                );
+                                            });
+
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add_enabled_ui(!is_running, |ui| {
+                                                        let active_cnt = self
+                                                            .unattend_config
+                                                            .active_tweak_count();
+                                                        let btn_lbl = format!(
+                                                            "Windows Setup & AutoPilot Studio ({})",
+                                                            active_cnt
+                                                        );
+                                                        let ubtn = egui::Button::new(
+                                                            RichText::new(btn_lbl)
+                                                                .size(11.0)
+                                                                .strong()
+                                                                .color(Color32::WHITE),
+                                                        )
+                                                        .fill(ACCENT_PRIMARY)
+                                                        .rounding(6.0);
+
+                                                        let resp = ui.add(ubtn);
+                                                        if resp.hovered() {
+                                                            ctx.set_cursor_icon(
+                                                                CursorIcon::PointingHand,
+                                                            );
+                                                        }
+                                                        if resp.clicked() {
+                                                            self.show_unattend_modal = true;
+                                                        }
+                                                    });
+                                                },
+                                            );
+                                        });
+                                    });
+                            }
                         }
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // STEP 2: TARGET USB DRIVE SELECTOR CARD + RESET / FORMAT USB UTILITY
+                // STEP 2: TARGET USB DRIVE SELECTOR CARD
                 let is_compressed = self
                     .image_meta
                     .as_ref()
@@ -1400,7 +1451,7 @@ impl eframe::App for BootLiteApp {
                     .fill(BG_CARD)
                     .stroke(Stroke::new(1.2_f32, BORDER_DIM))
                     .rounding(11.0)
-                    .inner_margin(11.0)
+                    .inner_margin(10.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1453,14 +1504,14 @@ impl eframe::App for BootLiteApp {
                             });
                         });
 
-                        ui.add_space(5.0);
+                        ui.add_space(4.0);
 
                         if self.drives.is_empty() {
                             egui::Frame::default()
                                 .fill(BG_APP)
                                 .stroke(Stroke::new(1.0_f32, BORDER_DIM))
                                 .rounding(9.0)
-                                .inner_margin(10.0)
+                                .inner_margin(9.0)
                                 .show(ui, |ui| {
                                     ui.vertical_centered(|ui| {
                                         ui.label(
@@ -1481,7 +1532,7 @@ impl eframe::App for BootLiteApp {
                         } else {
                             egui::ScrollArea::vertical()
                                 .id_salt("drives_scroll")
-                                .max_height(92.0)
+                                .max_height(88.0)
                                 .show(ui, |ui| {
                                     for (idx, d) in self.drives.iter().enumerate() {
                                         let is_selected = self.selected_drive_idx == Some(idx);
@@ -1513,7 +1564,7 @@ impl eframe::App for BootLiteApp {
                                                     draw_usb_icon(ui, is_selected);
                                                     ui.add_space(6.0);
                                                     ui.vertical(|ui| {
-                                                        ui.horizontal(|ui| {
+                                                        ui.horizontal_wrapped(|ui| {
                                                             ui.label(
                                                                 RichText::new(&d.model)
                                                                     .size(13.0)
@@ -1591,7 +1642,7 @@ impl eframe::App for BootLiteApp {
                         }
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
                 // STEP 3: FLASH OPTIONS & EXECUTION CARD
                 let selected_drive_valid = self
@@ -1619,9 +1670,9 @@ impl eframe::App for BootLiteApp {
                             .fill(BG_CARD)
                             .stroke(Stroke::new(1.2_f32, BORDER_DIM))
                             .rounding(11.0)
-                            .inner_margin(11.0)
+                            .inner_margin(10.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(
                                         RichText::new("Scheme:")
                                             .size(11.5)
@@ -1659,7 +1710,7 @@ impl eframe::App for BootLiteApp {
                                         }
                                     }
 
-                                    ui.add_space(8.0);
+                                    ui.add_space(6.0);
                                     ui.separator();
                                     ui.add_space(4.0);
 
@@ -1700,20 +1751,19 @@ impl eframe::App for BootLiteApp {
                                         }
                                     }
 
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            draw_toggle_switch(ui, &mut self.auto_eject);
-                                            ui.label(
-                                                RichText::new("Auto-Eject")
-                                                    .size(11.5)
-                                                    .color(TEXT_SUB),
-                                            );
-                                        },
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                    ui.add_space(4.0);
+
+                                    ui.label(
+                                        RichText::new("Auto-Eject:")
+                                            .size(11.5)
+                                            .color(TEXT_SUB),
                                     );
+                                    draw_toggle_switch(ui, &mut self.auto_eject);
                                 });
 
-                                ui.add_space(7.0);
+                                ui.add_space(6.0);
 
                                 ui.add_enabled_ui(can_flash, |ui| {
                                     let fill = if can_flash {
@@ -1730,7 +1780,7 @@ impl eframe::App for BootLiteApp {
                                     };
                                     let btn = egui::Button::new(
                                         RichText::new(btn_text)
-                                            .size(14.0)
+                                            .size(13.5)
                                             .strong()
                                             .color(if can_flash {
                                                 Color32::WHITE
@@ -1744,7 +1794,7 @@ impl eframe::App for BootLiteApp {
                                         if can_flash { ACCENT_GLOW } else { BORDER_DIM },
                                     ))
                                     .rounding(8.0)
-                                    .min_size(Vec2::new(ui.available_width(), 38.0));
+                                    .min_size(Vec2::new(ui.available_width(), 36.0));
 
                                     let resp = ui.add(btn);
                                     if resp.hovered() && can_flash {
@@ -1778,11 +1828,11 @@ impl eframe::App for BootLiteApp {
                             .fill(BG_CARD)
                             .stroke(Stroke::new(1.2_f32, ACCENT_PRIMARY))
                             .rounding(10.0)
-                            .inner_margin(12.0)
+                            .inner_margin(11.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(
-                                        RichText::new(&phase).size(13.0).strong().color(TEXT_MAIN),
+                                        RichText::new(&phase).size(12.5).strong().color(TEXT_MAIN),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1806,7 +1856,6 @@ impl eframe::App for BootLiteApp {
                                                 );
                                                 self.cancel_flag.store(true, Ordering::Relaxed);
                                             }
-                                            ui.add_space(6.0);
                                             let eta_label = match eta_secs {
                                                 Some(s) => format!("ETA {}", format_duration(s)),
                                                 None => "ETA calculating...".to_string(),
@@ -1832,7 +1881,7 @@ impl eframe::App for BootLiteApp {
                                         },
                                     );
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(5.0);
                                 let msg = format!(
                                     "{:.1}%  •  {} / {}",
                                     progress * 100.0,
@@ -1856,9 +1905,9 @@ impl eframe::App for BootLiteApp {
                             .fill(Color32::from_rgb(6, 46, 34))
                             .stroke(Stroke::new(1.2_f32, ACCENT_SUCCESS))
                             .rounding(10.0)
-                            .inner_margin(12.0)
+                            .inner_margin(11.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     draw_pill(
                                         ui,
                                         "VERIFIED",
@@ -1872,7 +1921,7 @@ impl eframe::App for BootLiteApp {
                                             format_duration(elapsed_secs),
                                             suffix
                                         ))
-                                        .size(13.0)
+                                        .size(12.5)
                                         .strong()
                                         .color(ACCENT_SUCCESS),
                                     );
@@ -1888,7 +1937,7 @@ impl eframe::App for BootLiteApp {
                                         },
                                     );
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(3.0);
                                 ui.monospace(
                                     RichText::new(format!("SHA-256: {}", hash))
                                         .size(11.0)
@@ -1904,9 +1953,9 @@ impl eframe::App for BootLiteApp {
                             .fill(Color32::from_rgb(6, 46, 34))
                             .stroke(Stroke::new(1.2_f32, ACCENT_SUCCESS))
                             .rounding(10.0)
-                            .inner_margin(12.0)
+                            .inner_margin(11.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     draw_pill(
                                         ui,
                                         "RESTORED",
@@ -1919,7 +1968,7 @@ impl eframe::App for BootLiteApp {
                                             drive_name,
                                             format_duration(elapsed_secs)
                                         ))
-                                        .size(13.0)
+                                        .size(12.5)
                                         .strong()
                                         .color(ACCENT_SUCCESS),
                                     );
@@ -1939,9 +1988,9 @@ impl eframe::App for BootLiteApp {
                             .fill(Color32::from_rgb(55, 12, 12))
                             .stroke(Stroke::new(1.2_f32, ACCENT_DANGER))
                             .rounding(10.0)
-                            .inner_margin(12.0)
+                            .inner_margin(11.0)
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     draw_pill(
                                         ui,
                                         "FAILED",
@@ -1950,7 +1999,7 @@ impl eframe::App for BootLiteApp {
                                     );
                                     ui.label(
                                         RichText::new(&err)
-                                            .size(12.0)
+                                            .size(11.5)
                                             .color(Color32::from_rgb(252, 165, 165)),
                                     );
                                     ui.with_layout(
@@ -1966,9 +2015,9 @@ impl eframe::App for BootLiteApp {
                     }
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(5.0);
 
-                // RUFUS-STYLE BEHIND-THE-SCENES LIVE ENGINE LOG CONSOLE
+                // LIVE HARDWARE & VERIFICATION LOG CONSOLE
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("LIVE HARDWARE & VERIFICATION LOG")
@@ -1996,7 +2045,7 @@ impl eframe::App for BootLiteApp {
                 });
 
                 if self.show_log_drawer {
-                    let remaining_h = (ui.available_height() - 6.0).max(110.0);
+                    let remaining_h = (ui.available_height() - 4.0).max(95.0);
                     egui::Frame::default()
                         .fill(BG_TERMINAL)
                         .stroke(Stroke::new(1.0_f32, BORDER_DIM))
@@ -2005,7 +2054,7 @@ impl eframe::App for BootLiteApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             egui::ScrollArea::vertical()
-                                .id_salt("rufus_log_console")
+                                .id_salt("hardware_log_console")
                                 .max_height(remaining_h)
                                 .min_scrolled_height(remaining_h)
                                 .stick_to_bottom(true)
@@ -2022,6 +2071,7 @@ impl eframe::App for BootLiteApp {
                                         } else if line.contains("STARTING FLASH JOB")
                                             || line.contains("Stream SHA-256")
                                             || line.contains("RESETTING & FORMATTING")
+                                            || line.contains("AutoPilot")
                                         {
                                             ACCENT_GLOW
                                         } else {
@@ -2039,15 +2089,15 @@ impl eframe::App for BootLiteApp {
                 }
             });
 
-        // WINDOWS 10/11 UNATTENDED SETUP STUDIO MODAL (BASIC + ADVANCED + LIVE XML PREVIEW)
+        // WINDOWS 10/11 UNATTENDED & AUTOPILOT SETUP STUDIO MODAL
         if self.show_unattend_modal {
-            egui::Window::new("Windows 10/11 Unattended Setup Studio (autounattend.xml)")
+            egui::Window::new("Windows 10/11 Setup & AutoPilot Studio")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.set_min_width(540.0);
-                    ui.set_max_width(540.0);
+                    ui.set_min_width(560.0);
+                    ui.set_max_width(560.0);
 
                     egui::Frame::default()
                         .fill(Color32::from_rgb(15, 21, 36))
@@ -2056,16 +2106,37 @@ impl eframe::App for BootLiteApp {
                         .inner_margin(10.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                draw_toggle_switch(
+                                    ui,
+                                    &mut self.unattend_config.extract_autopilot_hash,
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Extract Laptop AutoPilot Hardware Hash to USB (\\AutoPilot\\)",
+                                    )
+                                    .size(12.5)
+                                    .strong()
+                                    .color(if self.unattend_config.extract_autopilot_hash {
+                                        ACCENT_SUCCESS
+                                    } else {
+                                        TEXT_MAIN
+                                    }),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
                                 draw_toggle_switch(ui, &mut self.unattend_config.enabled);
                                 ui.label(
-                                    RichText::new("Enable Unattended Windows Setup (Inject autounattend.xml)")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(if self.unattend_config.enabled {
-                                            ACCENT_SUCCESS
-                                        } else {
-                                            TEXT_MAIN
-                                        }),
+                                    RichText::new(
+                                        "Enable Unattended Windows Setup Tweaks (autounattend.xml)",
+                                    )
+                                    .size(12.5)
+                                    .strong()
+                                    .color(if self.unattend_config.enabled {
+                                        ACCENT_GLOW
+                                    } else {
+                                        TEXT_SUB
+                                    }),
                                 );
                             });
                         });
@@ -2073,16 +2144,17 @@ impl eframe::App for BootLiteApp {
                     ui.add_space(6.0);
 
                     // Studio Tabs
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         for (tab, label) in [
-                            (UnattendTab::Basic, "Basic (Rufus Tweaks)"),
+                            (UnattendTab::Basic, "Basic Setup"),
                             (UnattendTab::Advanced, "Advanced & De-Bloat"),
+                            (UnattendTab::AutoPilot, "AutoPilot Hash Script"),
                             (UnattendTab::XmlPreview, "Live XML Preview"),
                         ] {
                             let active = self.unattend_tab == tab;
                             let btn = egui::Button::new(
                                 RichText::new(label)
-                                    .size(12.0)
+                                    .size(11.5)
                                     .strong()
                                     .color(if active { Color32::WHITE } else { TEXT_SUB }),
                             )
@@ -2100,9 +2172,9 @@ impl eframe::App for BootLiteApp {
 
                     ui.separator();
 
-                    ui.add_enabled_ui(self.unattend_config.enabled, |ui| {
-                        match self.unattend_tab {
-                            UnattendTab::Basic => {
+                    match self.unattend_tab {
+                        UnattendTab::Basic => {
+                            ui.add_enabled_ui(self.unattend_config.enabled, |ui| {
                                 ui.checkbox(
                                     &mut self.unattend_config.bypass_hardware_checks,
                                     "Remove requirement for 4GB+ RAM, Secure Boot, and TPM 2.0",
@@ -2132,7 +2204,7 @@ impl eframe::App for BootLiteApp {
                                                 egui::TextEdit::singleline(
                                                     &mut self.unattend_config.local_username,
                                                 )
-                                                .desired_width(140.0),
+                                                .desired_width(135.0),
                                             );
                                             ui.label("Password (optional):");
                                             ui.add(
@@ -2140,7 +2212,7 @@ impl eframe::App for BootLiteApp {
                                                     &mut self.unattend_config.local_password,
                                                 )
                                                 .password(true)
-                                                .desired_width(140.0),
+                                                .desired_width(135.0),
                                             );
                                         });
                                         ui.checkbox(
@@ -2149,8 +2221,10 @@ impl eframe::App for BootLiteApp {
                                         );
                                     });
                                 }
-                            }
-                            UnattendTab::Advanced => {
+                            });
+                        }
+                        UnattendTab::Advanced => {
+                            ui.add_enabled_ui(self.unattend_config.enabled, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("Custom PC Hostname (optional):");
                                     ui.add(
@@ -2186,49 +2260,90 @@ impl eframe::App for BootLiteApp {
                                     egui::TextEdit::singleline(
                                         &mut self.unattend_config.custom_firstlogon_cmd,
                                     )
-                                    .hint_text("Optional command to execute on first desktop login...")
-                                    .desired_width(510.0)
+                                    .hint_text(
+                                        "Optional command to execute on first desktop login...",
+                                    )
+                                    .desired_width(520.0)
                                     .font(egui::TextStyle::Monospace),
                                 );
-                            }
-                            UnattendTab::XmlPreview => {
-                                let xml_str = self.unattend_config.generate_xml();
-                                egui::Frame::default()
-                                    .fill(BG_TERMINAL)
-                                    .stroke(Stroke::new(1.0_f32, BORDER_DIM))
-                                    .rounding(6.0)
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("unattend_xml_scroll")
-                                            .max_height(190.0)
-                                            .show(ui, |ui| {
-                                                ui.monospace(
-                                                    RichText::new(&xml_str)
-                                                        .size(10.5)
-                                                        .color(ACCENT_GLOW),
-                                                );
-                                            });
-                                    });
-                                ui.horizontal(|ui| {
-                                    if small_slate_button(ui, "Copy XML to Clipboard").clicked() {
-                                        ctx.copy_text(xml_str.clone());
-                                    }
-                                    if small_slate_button(ui, "Save autounattend.xml...").clicked()
-                                    {
-                                        if let Some(save_path) = rfd::FileDialog::new()
-                                            .set_file_name("autounattend.xml")
-                                            .save_file()
-                                        {
-                                            let _ = fs::write(save_path, xml_str.as_bytes());
-                                        }
-                                    }
-                                });
-                            }
+                            });
                         }
-                    });
+                        UnattendTab::AutoPilot => {
+                            ui.label(
+                                RichText::new(
+                                    "How USB AutoPilot Hardware Hash Extraction Works:",
+                                )
+                                .size(12.5)
+                                .strong()
+                                .color(TEXT_MAIN),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "• BootLite creates an 'AutoPilot' folder on the USB drive containing Extract-AutoPilotHash.ps1 and Extract-AutoPilotHash.cmd.\n\
+                                     • During Windows installation (or when you run Extract-AutoPilotHash.cmd on any laptop), it queries WMI MDM_DevDetail_Ext01 offline and writes:\n\
+                                       1. \\AutoPilot\\AutoPilotHWID_<SerialNumber>_<Hostname>.csv\n\
+                                       2. \\AutoPilot\\AutoPilotHWID_Fleet.csv (appends multiple laptops into one Intune-ready CSV)",
+                                )
+                                .size(11.0)
+                                .color(TEXT_SUB),
+                            );
+                            ui.add_space(4.0);
+                            let ps1_str =
+                                bootlite_core::unattend::generate_autopilot_ps1_script();
+                            egui::Frame::default()
+                                .fill(BG_TERMINAL)
+                                .stroke(Stroke::new(1.0_f32, BORDER_DIM))
+                                .rounding(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("autopilot_ps1_scroll")
+                                        .max_height(140.0)
+                                        .show(ui, |ui| {
+                                            ui.monospace(
+                                                RichText::new(ps1_str)
+                                                    .size(10.0)
+                                                    .color(ACCENT_SUCCESS),
+                                            );
+                                        });
+                                });
+                        }
+                        UnattendTab::XmlPreview => {
+                            let xml_str = self.unattend_config.generate_xml();
+                            egui::Frame::default()
+                                .fill(BG_TERMINAL)
+                                .stroke(Stroke::new(1.0_f32, BORDER_DIM))
+                                .rounding(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("unattend_xml_scroll")
+                                        .max_height(185.0)
+                                        .show(ui, |ui| {
+                                            ui.monospace(
+                                                RichText::new(&xml_str)
+                                                    .size(10.5)
+                                                    .color(ACCENT_GLOW),
+                                            );
+                                        });
+                                });
+                            ui.horizontal(|ui| {
+                                if small_slate_button(ui, "Copy XML to Clipboard").clicked() {
+                                    ctx.copy_text(xml_str.clone());
+                                }
+                                if small_slate_button(ui, "Save autounattend.xml...").clicked() {
+                                    if let Some(save_path) = rfd::FileDialog::new()
+                                        .set_file_name("autounattend.xml")
+                                        .save_file()
+                                    {
+                                        let _ = fs::write(save_path, xml_str.as_bytes());
+                                    }
+                                }
+                            });
+                        }
+                    }
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal(|ui| {
                         let save_btn = egui::Button::new(
@@ -2277,11 +2392,11 @@ impl eframe::App for BootLiteApp {
                                 .size(12.0)
                                 .color(ACCENT_WARN),
                             );
-                            if is_win_iso && self.unattend_config.enabled {
+                            if is_win_iso && self.unattend_config.should_inject_unattend() {
                                 ui.add_space(4.0);
                                 ui.label(
                                     RichText::new(format!(
-                                        "Unattended Setup: autounattend.xml will be injected ({} tweaks active).",
+                                        "Windows Studio: \\AutoPilot\\ hash extractor & autounattend.xml active ({} features).",
                                         self.unattend_config.active_tweak_count()
                                     ))
                                     .size(11.5)

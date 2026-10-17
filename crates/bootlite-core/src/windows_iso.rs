@@ -1,3 +1,4 @@
+use crate::unattend::{generate_autopilot_cmd_launcher, generate_autopilot_ps1_script};
 use crate::{FlashProgress, PartitionScheme, UsbDrive, VerifyMode};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -304,6 +305,20 @@ where
             on_progress,
         )?;
         written_targets.push((src_path.clone(), dst_data, *file_len, digest));
+    }
+
+    // Always provision the \AutoPilot\ folder and hardware hash extraction scripts on the USB drive
+    for root_dir in [efi_mount, Some(data_mount)].into_iter().flatten() {
+        let ap_dir = root_dir.join("AutoPilot");
+        let _ = fs::create_dir_all(&ap_dir);
+        let _ = fs::write(
+            ap_dir.join("Extract-AutoPilotHash.ps1"),
+            generate_autopilot_ps1_script().as_bytes(),
+        );
+        let _ = fs::write(
+            ap_dir.join("Extract-AutoPilotHash.cmd"),
+            generate_autopilot_cmd_launcher().as_bytes(),
+        );
     }
 
     if let Some(xml) = unattend_xml {

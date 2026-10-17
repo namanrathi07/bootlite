@@ -647,7 +647,7 @@ where
 
     if let Ok(meta) = inspect_image(image_path) {
         if meta.is_windows_udf_iso {
-            let xml_opt = unattend.filter(|u| u.enabled).map(|u| u.generate_xml());
+            let xml_opt = unattend.filter(|u| u.should_inject_unattend()).map(|u| u.generate_xml());
             return windows_iso::flash_windows_iso_to_usb(
                 image_path,
                 drive,
@@ -903,4 +903,32 @@ where
     }
 
     Ok(expected_full_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_sha256_input() {
+        let raw = "SHA256: E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  ubuntu.iso";
+        assert_eq!(
+            normalize_sha256_input(raw),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+        );
+        assert_eq!(normalize_sha256_input("   "), None);
+    }
+
+    #[test]
+    fn test_inspect_windows_udf_header() {
+        let tmp = std::env::temp_dir().join("bootlite_unit_test_win11.iso");
+        let mut data = vec![0u8; 65536];
+        data[0x8001..0x8006].copy_from_slice(b"CD001");
+        data[0x8801..0x8806].copy_from_slice(b"NSR03");
+        std::fs::write(&tmp, &data).unwrap();
+
+        let meta = inspect_image(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(meta.is_windows_udf_iso);
+    }
 }
