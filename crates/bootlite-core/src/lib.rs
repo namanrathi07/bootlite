@@ -1,5 +1,8 @@
 pub mod platform;
+pub mod unattend;
 pub mod windows_iso;
+
+pub use unattend::WindowsUnattendConfig;
 
 use anyhow::{Context, Result};
 use bzip2_rs::DecoderReader as Bz2Decoder;
@@ -607,6 +610,29 @@ pub fn flash_and_verify_with_options<F>(
     scheme: PartitionScheme,
     verify_mode: VerifyMode,
     cancel_flag: Option<&AtomicBool>,
+    on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(FlashProgress),
+{
+    flash_and_verify_with_unattend(
+        image_path,
+        drive,
+        scheme,
+        verify_mode,
+        None,
+        cancel_flag,
+        on_progress,
+    )
+}
+
+pub fn flash_and_verify_with_unattend<F>(
+    image_path: &Path,
+    drive: &UsbDrive,
+    scheme: PartitionScheme,
+    verify_mode: VerifyMode,
+    unattend: Option<&WindowsUnattendConfig>,
+    cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
 where
@@ -621,11 +647,13 @@ where
 
     if let Ok(meta) = inspect_image(image_path) {
         if meta.is_windows_udf_iso {
+            let xml_opt = unattend.filter(|u| u.enabled).map(|u| u.generate_xml());
             return windows_iso::flash_windows_iso_to_usb(
                 image_path,
                 drive,
                 scheme,
                 verify_mode,
+                xml_opt.as_deref(),
                 cancel_flag,
                 on_progress,
             );
@@ -673,7 +701,6 @@ where
     let mut deferred_first_chunk: Option<Vec<u8>> = None;
     let mut is_first_chunk = true;
 
-    // For Fast Verify: record up to 32 sample block digests (64 KB each) while streaming
     let sample_stride: u64 = (file_len / 32).max(CHUNK_SIZE as u64) & !((CHUNK_SIZE as u64) - 1);
     let mut next_sample_offset: u64 = CHUNK_SIZE as u64;
     let mut fast_samples: Vec<(u64, usize, [u8; 32])> = Vec::with_capacity(34);
@@ -858,7 +885,6 @@ where
         }
     }
 
-    // Commit and verify the 4 MB boot record at Sector 0 last
     if let Some(first_chunk) = deferred_first_chunk {
         device
             .seek(SeekFrom::Start(0))

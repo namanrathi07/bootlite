@@ -93,8 +93,6 @@ where
         });
     }
 
-    // Only force per-file hardware sync on large WIM/ESD archives (> 64 MB) to avoid
-    // stalling the USB controller 1,100 times on tiny .dll / .mui files.
     if file_len >= 64 * 1024 * 1024 {
         writer.sync_all()?;
     }
@@ -174,7 +172,7 @@ fn fast_verify_spot_check(src_file: &Path, usb_file: &Path, file_len: u64) -> Re
         return Ok(());
     }
 
-    let sample_size: usize = 512 * 1024; // 512 KB spot check at head, middle, and tail
+    let sample_size: usize = 512 * 1024;
     let mut src = File::open(src_file)?;
     let mut dst = File::open(usb_file)?;
     let mut b1 = vec![0u8; sample_size];
@@ -212,6 +210,7 @@ fn copy_and_verify_windows_tree<F>(
     efi_mount: Option<&Path>,
     data_mount: &Path,
     verify_mode: VerifyMode,
+    unattend_xml: Option<&str>,
     cancel_flag: Option<&AtomicBool>,
     on_progress: &mut F,
 ) -> Result<String>
@@ -237,8 +236,6 @@ where
             if is_uefi_boot_file(&rel) {
                 total_write_bytes += *len;
             }
-            // In Dual-Partition mode, sources/boot.wim (600 MB) is already on WINBOOT (FAT32).
-            // Skipping duplicate copy to WINSETUP saves 600 MB of slow USB writing!
             if rel != "sources/boot.wim" {
                 total_write_bytes += *len;
             }
@@ -307,6 +304,17 @@ where
             on_progress,
         )?;
         written_targets.push((src_path.clone(), dst_data, *file_len, digest));
+    }
+
+    if let Some(xml) = unattend_xml {
+        if let Some(efi_dir) = efi_mount {
+            let efi_xml = efi_dir.join("autounattend.xml");
+            fs::write(&efi_xml, xml.as_bytes())
+                .context("Failed to write autounattend.xml to WINBOOT partition")?;
+        }
+        let data_xml = data_mount.join("autounattend.xml");
+        fs::write(&data_xml, xml.as_bytes())
+            .context("Failed to write autounattend.xml to WINSETUP partition")?;
     }
 
     match verify_mode {
@@ -382,6 +390,7 @@ pub fn flash_windows_iso_to_usb<F>(
     drive: &UsbDrive,
     _scheme: PartitionScheme,
     verify_mode: VerifyMode,
+    unattend_xml: Option<&str>,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -499,6 +508,7 @@ where
             Some(&efi_mount),
             &data_mount,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?
@@ -528,6 +538,7 @@ where
             None,
             &data_mount,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?
@@ -568,6 +579,7 @@ pub fn flash_windows_iso_to_usb<F>(
     drive: &UsbDrive,
     scheme: PartitionScheme,
     verify_mode: VerifyMode,
+    unattend_xml: Option<&str>,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -598,7 +610,6 @@ where
         );
     }
 
-    // Forcibly dismount any open Explorer handles on the USB drive, then release locks for diskpart
     let _ = crate::platform::unmount_drive(drive);
     crate::platform::finish_device(None);
 
@@ -695,6 +706,7 @@ where
             Some(&efi_mount),
             &data_mount,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?
@@ -746,6 +758,7 @@ where
             None,
             &data_mount,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?
@@ -760,6 +773,7 @@ pub fn flash_windows_iso_to_usb<F>(
     drive: &UsbDrive,
     scheme: PartitionScheme,
     verify_mode: VerifyMode,
+    unattend_xml: Option<&str>,
     cancel_flag: Option<&AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -907,6 +921,7 @@ where
             Some(&efi_mnt),
             &data_mnt,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?
@@ -959,6 +974,7 @@ where
             None,
             &data_mnt,
             verify_mode,
+            unattend_xml,
             cancel_flag,
             &mut on_progress,
         )?

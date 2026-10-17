@@ -88,9 +88,9 @@ cat << 'PLIST' > "${BUNDLE_DIR}/Contents/Info.plist"
     <key>CFBundleIdentifier</key>
     <string>dev.bootlite.app</string>
     <key>CFBundleVersion</key>
-    <string>0.4.1</string>
+    <string>0.5.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.4.1</string>
+    <string>0.5.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>

@@ -526,12 +526,20 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
             let _ = dp.wait();
         }
         let _ = unmount_drive(drive);
-        let reopened = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&drive.raw_device_path)
-            .context("Failed to reopen PhysicalDrive after partition clean")?;
+        let mut reopened = None;
+        for _ in 0..10 {
+            if let Ok(f) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&drive.raw_device_path)
+            {
+                reopened = Some(f);
+                break;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        let reopened = reopened.context("Failed to reopen PhysicalDrive after partition clean")?;
         let _ = ioctl_none(reopened.as_raw_handle(), FSCTL_ALLOW_EXTENDED_DASD_IO);
         return Ok(reopened);
     }

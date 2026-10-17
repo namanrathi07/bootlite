@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bootlite_core::{
-    compute_image_sha256, eject_drive, flash_and_verify_with_options, inspect_image,
+    compute_image_sha256, eject_drive, flash_and_verify_with_unattend, inspect_image,
     is_image_on_drive, list_safe_usb_drives, normalize_sha256_input,
     reset_and_format_drive_with_scheme, windows_iso::WIN_ISO_OVERHEAD_BYTES, ImageMetadata,
-    PartitionScheme, UsbDrive, VerifyMode,
+    PartitionScheme, UsbDrive, VerifyMode, WindowsUnattendConfig,
 };
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 use std::fs;
@@ -27,6 +27,13 @@ const ACCENT_DANGER: Color32 = Color32::from_rgb(239, 68, 68);
 const TEXT_MAIN: Color32 = Color32::from_rgb(248, 250, 252);
 const TEXT_SUB: Color32 = Color32::from_rgb(148, 163, 184);
 const TEXT_DIM: Color32 = Color32::from_rgb(100, 116, 139);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnattendTab {
+    Basic,
+    Advanced,
+    XmlPreview,
+}
 
 struct SleepInhibitor {
     #[cfg(unix)]
@@ -415,7 +422,7 @@ fn build_window_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 750.0])
+            .with_inner_size([710.0, 760.0])
             .with_resizable(false)
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(build_window_icon())),
@@ -482,6 +489,9 @@ struct BootLiteApp {
     auto_eject: bool,
     partition_scheme: PartitionScheme,
     verify_mode: VerifyMode,
+    unattend_config: WindowsUnattendConfig,
+    show_unattend_modal: bool,
+    unattend_tab: UnattendTab,
     show_confirm_modal: bool,
     show_reset_modal: bool,
     show_exit_modal: bool,
@@ -499,7 +509,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.4.1 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.5.0 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -521,6 +531,9 @@ impl BootLiteApp {
             auto_eject: false,
             partition_scheme: PartitionScheme::Auto,
             verify_mode: VerifyMode::Fast,
+            unattend_config: WindowsUnattendConfig::default(),
+            show_unattend_modal: false,
+            unattend_tab: UnattendTab::Basic,
             show_confirm_modal: false,
             show_reset_modal: false,
             show_exit_modal: false,
@@ -575,6 +588,12 @@ impl BootLiteApp {
                         meta.compression
                     ),
                 );
+                if meta.is_windows_udf_iso {
+                    push_log(
+                        &self.logs,
+                        "Windows 10/11 ISO detected -> 'Customize Windows Setup (Unattended)' Studio unlocked",
+                    );
+                }
                 if let Some(warn) = &meta.warning {
                     push_log(&self.logs, format!("[WARN] {}", warn));
                 }
@@ -802,6 +821,7 @@ impl BootLiteApp {
         let should_eject = self.auto_eject;
         let scheme = self.partition_scheme;
         let vmode = self.verify_mode;
+        let unattend_cfg = self.unattend_config.clone();
 
         self.cancel_flag.store(false, Ordering::Relaxed);
         let cancel_clone = Arc::clone(&self.cancel_flag);
@@ -820,6 +840,15 @@ impl BootLiteApp {
                 vmode.label()
             ),
         );
+        if unattend_cfg.enabled {
+            push_log(
+                &logs_clone,
+                format!(
+                    "Unattended Windows Setup ACTIVE -> Injecting autounattend.xml ({} tweaks enabled)",
+                    unattend_cfg.active_tweak_count()
+                ),
+            );
+        }
         push_log(
             &logs_clone,
             format!(
@@ -845,11 +874,12 @@ impl BootLiteApp {
             let mut last_phase = String::new();
             let mut last_logged_bucket: u64 = 0;
 
-            let result = flash_and_verify_with_options(
+            let result = flash_and_verify_with_unattend(
                 &image_path,
                 &drive,
                 scheme,
                 vmode,
+                Some(&unattend_cfg),
                 Some(&cancel_clone),
                 |prog| {
                     let fraction = if prog.total_bytes > 0 {
@@ -985,6 +1015,12 @@ impl eframe::App for BootLiteApp {
             }
         }
 
+        let is_win_iso = self
+            .image_meta
+            .as_ref()
+            .map(|m| m.is_windows_udf_iso)
+            .unwrap_or(false);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(BG_APP).inner_margin(18.0))
             .show(ctx, |ui| {
@@ -1002,14 +1038,14 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.4.1",
+                                "v0.5.0",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
                         });
                         ui.label(
                             RichText::new(
-                                "Cross-Platform Raw USB Flasher, Windows 10/11 Builder & Verifier",
+                                "Cross-Platform Raw USB Flasher, Windows 10/11 Studio & Verifier",
                             )
                             .size(11.5)
                             .color(TEXT_SUB),
@@ -1115,7 +1151,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(6.0);
 
-                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD + OPTIONAL SHA-256 CHECKSUM BAR
+                // STEP 1: INTERACTIVE IMAGE DROPZONE CARD + SHA-256 BAR + WINDOWS UNATTENDED BUTTON
                 let has_img = self.image_path.is_some();
                 let has_warn = self
                     .image_meta
@@ -1273,8 +1309,8 @@ impl eframe::App for BootLiteApp {
                                         .color(TEXT_SUB),
                                 );
                                 let edit = egui::TextEdit::singleline(&mut self.expected_sha256)
-                                    .hint_text("Optional: paste official SHA-256 checksum to verify image...")
-                                    .desired_width(340.0)
+                                    .hint_text("Optional: paste official SHA-256 checksum...")
+                                    .desired_width(if is_win_iso { 205.0 } else { 340.0 })
                                     .font(egui::TextStyle::Monospace);
                                 ui.add_enabled(!is_running, edit);
 
@@ -1284,8 +1320,59 @@ impl eframe::App for BootLiteApp {
                                     {
                                         self.expected_sha256.clear();
                                     }
-                                    if small_slate_button(ui, "Check File Hash").clicked() {
+                                    if small_slate_button(ui, "Check Hash").clicked() {
                                         self.start_file_hash_check();
+                                    }
+
+                                    // WINDOWS-ISO-ONLY UNATTENDED SETUP STUDIO BUTTON
+                                    if is_win_iso {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let active_cnt =
+                                                    self.unattend_config.active_tweak_count();
+                                                let btn_lbl = if active_cnt > 0 {
+                                                    format!(
+                                                        "Windows Setup Studio ({} Tweaks)",
+                                                        active_cnt
+                                                    )
+                                                } else {
+                                                    "Customize Windows Setup...".to_string()
+                                                };
+                                                let ubtn = egui::Button::new(
+                                                    RichText::new(btn_lbl)
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(if active_cnt > 0 {
+                                                            ACCENT_SUCCESS
+                                                        } else {
+                                                            ACCENT_GLOW
+                                                        }),
+                                                )
+                                                .fill(if active_cnt > 0 {
+                                                    Color32::from_rgb(6, 62, 46)
+                                                } else {
+                                                    Color32::from_rgb(23, 37, 84)
+                                                })
+                                                .stroke(Stroke::new(
+                                                    1.0_f32,
+                                                    if active_cnt > 0 {
+                                                        ACCENT_SUCCESS
+                                                    } else {
+                                                        ACCENT_PRIMARY
+                                                    },
+                                                ))
+                                                .rounding(6.0);
+
+                                                let resp = ui.add(ubtn);
+                                                if resp.hovered() {
+                                                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                                }
+                                                if resp.clicked() {
+                                                    self.show_unattend_modal = true;
+                                                }
+                                            },
+                                        );
                                     }
                                 });
                             });
@@ -1299,11 +1386,6 @@ impl eframe::App for BootLiteApp {
                     .image_meta
                     .as_ref()
                     .map(|m| m.is_compressed)
-                    .unwrap_or(false);
-                let is_win_iso = self
-                    .image_meta
-                    .as_ref()
-                    .map(|m| m.is_windows_udf_iso)
                     .unwrap_or(false);
                 let required_bytes = if is_win_iso {
                     self.image_size + WIN_ISO_OVERHEAD_BYTES
@@ -1508,7 +1590,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(6.0);
 
-                // STEP 3: FLASH OPTIONS & EXECUTION CARD (CLEAN TWO-ROW DESIGN — ZERO OVERLAP)
+                // STEP 3: FLASH OPTIONS & EXECUTION CARD
                 let selected_drive_valid = self
                     .selected_drive_idx
                     .and_then(|idx| self.drives.get(idx))
@@ -1536,7 +1618,6 @@ impl eframe::App for BootLiteApp {
                             .rounding(11.0)
                             .inner_margin(11.0)
                             .show(ui, |ui| {
-                                // Row 1: Partition Scheme, Verification Mode, and Auto-Eject
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new("Scheme:")
@@ -1631,7 +1712,6 @@ impl eframe::App for BootLiteApp {
 
                                 ui.add_space(7.0);
 
-                                // Row 2: Full-Width Primary Flash Button
                                 ui.add_enabled_ui(can_flash, |ui| {
                                     let fill = if can_flash {
                                         ACCENT_PRIMARY
@@ -1885,7 +1965,7 @@ impl eframe::App for BootLiteApp {
 
                 ui.add_space(6.0);
 
-                // RUFUS-STYLE BEHIND-THE-SCENES LIVE ENGINE LOG CONSOLE (EXPANDS TO FILL REMAINING HEIGHT)
+                // RUFUS-STYLE BEHIND-THE-SCENES LIVE ENGINE LOG CONSOLE
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("LIVE HARDWARE & VERIFICATION LOG")
@@ -1956,6 +2036,217 @@ impl eframe::App for BootLiteApp {
                 }
             });
 
+        // WINDOWS 10/11 UNATTENDED SETUP STUDIO MODAL (BASIC + ADVANCED + LIVE XML PREVIEW)
+        if self.show_unattend_modal {
+            egui::Window::new("Windows 10/11 Unattended Setup Studio (autounattend.xml)")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(540.0);
+                    ui.set_max_width(540.0);
+
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(15, 21, 36))
+                        .stroke(Stroke::new(1.0_f32, BORDER_DIM))
+                        .rounding(8.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                draw_toggle_switch(ui, &mut self.unattend_config.enabled);
+                                ui.label(
+                                    RichText::new("Enable Unattended Windows Setup (Inject autounattend.xml)")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(if self.unattend_config.enabled {
+                                            ACCENT_SUCCESS
+                                        } else {
+                                            TEXT_MAIN
+                                        }),
+                                );
+                            });
+                        });
+
+                    ui.add_space(6.0);
+
+                    // Studio Tabs
+                    ui.horizontal(|ui| {
+                        for (tab, label) in [
+                            (UnattendTab::Basic, "Basic (Rufus Tweaks)"),
+                            (UnattendTab::Advanced, "Advanced & De-Bloat"),
+                            (UnattendTab::XmlPreview, "Live XML Preview"),
+                        ] {
+                            let active = self.unattend_tab == tab;
+                            let btn = egui::Button::new(
+                                RichText::new(label)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if active { Color32::WHITE } else { TEXT_SUB }),
+                            )
+                            .fill(if active {
+                                ACCENT_PRIMARY
+                            } else {
+                                Color32::from_rgb(30, 41, 59)
+                            })
+                            .rounding(6.0);
+                            if ui.add(btn).clicked() {
+                                self.unattend_tab = tab;
+                            }
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.add_enabled_ui(self.unattend_config.enabled, |ui| {
+                        match self.unattend_tab {
+                            UnattendTab::Basic => {
+                                ui.checkbox(
+                                    &mut self.unattend_config.bypass_hardware_checks,
+                                    "Remove requirement for 4GB+ RAM, Secure Boot, and TPM 2.0",
+                                );
+                                ui.checkbox(
+                                    &mut self.unattend_config.bypass_ms_account,
+                                    "Remove requirement for an online Microsoft Account (OOBE\\BYPASSNRO)",
+                                );
+                                ui.checkbox(
+                                    &mut self.unattend_config.disable_privacy_questions,
+                                    "Disable all OOBE data collection / telemetry privacy questions",
+                                );
+                                ui.checkbox(
+                                    &mut self.unattend_config.disable_bitlocker,
+                                    "Disable automatic BitLocker device encryption on first boot",
+                                );
+                                ui.add_space(4.0);
+                                ui.checkbox(
+                                    &mut self.unattend_config.create_local_account,
+                                    "Create a pre-configured Local Administrator Account:",
+                                );
+                                if self.unattend_config.create_local_account {
+                                    ui.indent("local_acct_indent", |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Username:");
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.unattend_config.local_username,
+                                                )
+                                                .desired_width(140.0),
+                                            );
+                                            ui.label("Password (optional):");
+                                            ui.add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.unattend_config.local_password,
+                                                )
+                                                .password(true)
+                                                .desired_width(140.0),
+                                            );
+                                        });
+                                        ui.checkbox(
+                                            &mut self.unattend_config.auto_logon,
+                                            "Automatically log into this account on first boot",
+                                        );
+                                    });
+                                }
+                            }
+                            UnattendTab::Advanced => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Custom PC Hostname (optional):");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.unattend_config.computer_name,
+                                        )
+                                        .hint_text("e.g. WORKSTATION-01")
+                                        .desired_width(180.0),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Windows Setup Language / Locale:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.unattend_config.ui_language,
+                                        )
+                                        .hint_text("en-US")
+                                        .desired_width(100.0),
+                                    );
+                                });
+                                ui.add_space(4.0);
+                                ui.checkbox(
+                                    &mut self.unattend_config.remove_bloatware_widgets,
+                                    "Disable Windows 11 Widgets, Consumer Features & Start Menu Bing Search",
+                                );
+                                ui.checkbox(
+                                    &mut self.unattend_config.classic_context_menu_and_ext,
+                                    "Restore classic Windows 10 right-click menu & show file extensions",
+                                );
+                                ui.add_space(4.0);
+                                ui.label("Custom First-Logon Command (CMD / PowerShell):");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.unattend_config.custom_firstlogon_cmd,
+                                    )
+                                    .hint_text("Optional command to execute on first desktop login...")
+                                    .desired_width(510.0)
+                                    .font(egui::TextStyle::Monospace),
+                                );
+                            }
+                            UnattendTab::XmlPreview => {
+                                let xml_str = self.unattend_config.generate_xml();
+                                egui::Frame::default()
+                                    .fill(BG_TERMINAL)
+                                    .stroke(Stroke::new(1.0_f32, BORDER_DIM))
+                                    .rounding(6.0)
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("unattend_xml_scroll")
+                                            .max_height(190.0)
+                                            .show(ui, |ui| {
+                                                ui.monospace(
+                                                    RichText::new(&xml_str)
+                                                        .size(10.5)
+                                                        .color(ACCENT_GLOW),
+                                                );
+                                            });
+                                    });
+                                ui.horizontal(|ui| {
+                                    if small_slate_button(ui, "Copy XML to Clipboard").clicked() {
+                                        ctx.copy_text(xml_str.clone());
+                                    }
+                                    if small_slate_button(ui, "Save autounattend.xml...").clicked()
+                                    {
+                                        if let Some(save_path) = rfd::FileDialog::new()
+                                            .set_file_name("autounattend.xml")
+                                            .save_file()
+                                        {
+                                            let _ = fs::write(save_path, xml_str.as_bytes());
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let save_btn = egui::Button::new(
+                            RichText::new("Apply & Close")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_PRIMARY)
+                        .rounding(7.0);
+                        if ui.add(save_btn).clicked() {
+                            self.show_unattend_modal = false;
+                        }
+                        if small_slate_button(ui, "Reset Defaults").clicked() {
+                            let was_enabled = self.unattend_config.enabled;
+                            self.unattend_config = WindowsUnattendConfig::default();
+                            self.unattend_config.enabled = was_enabled;
+                        }
+                    });
+                });
+        }
+
         // SAFETY CONFIRMATION MODAL (FLASH)
         if self.show_confirm_modal {
             egui::Window::new("Confirm Target Drive Erase")
@@ -1983,6 +2274,17 @@ impl eframe::App for BootLiteApp {
                                 .size(12.0)
                                 .color(ACCENT_WARN),
                             );
+                            if is_win_iso && self.unattend_config.enabled {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Unattended Setup: autounattend.xml will be injected ({} tweaks active).",
+                                        self.unattend_config.active_tweak_count()
+                                    ))
+                                    .size(11.5)
+                                    .color(ACCENT_SUCCESS),
+                                );
+                            }
                         }
                     }
                     ui.add_space(14.0);
