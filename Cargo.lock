@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "bootlite-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bootlite-core",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "bootlite-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bzip2-rs",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "bootlite-gui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bootlite-core",

@@ -623,3 +623,8 @@ pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme
     }
     Ok(())
 }
+
+pub fn open_user_uid_init(_uid: u32) {}
+pub fn open_user_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}

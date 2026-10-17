@@ -247,7 +247,7 @@ pub fn compute_image_sha256<F>(
 where
     F: FnMut(FlashProgress),
 {
-    let file = File::open(image_path)
+    let file = platform::open_user_file(image_path)
         .with_context(|| format!("Failed to open image file: {}", image_path.display()))?;
     let total_bytes = file.metadata()?.len().max(1);
     let mut reader = BufReader::with_capacity(CHUNK_SIZE, file);
@@ -372,7 +372,7 @@ fn open_decompressed_stream<R: Read + Send + 'static>(
 }
 
 pub fn inspect_image(image_path: &Path) -> Result<ImageMetadata> {
-    let mut file = File::open(image_path)
+    let mut file = platform::open_user_file(image_path)
         .with_context(|| format!("Failed to open image: {}", image_path.display()))?;
     let file_size = file.metadata()?.len();
     let kind = CompressionKind::from_path(image_path);
@@ -660,7 +660,7 @@ where
         }
     }
 
-    let img_file = File::open(image_path)
+    let img_file = platform::open_user_file(image_path)
         .with_context(|| format!("Failed to open image file: {}", image_path.display()))?;
     let file_len = img_file.metadata()?.len().max(1);
     let kind = CompressionKind::from_path(image_path);

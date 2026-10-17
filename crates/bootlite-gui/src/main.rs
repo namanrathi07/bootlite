@@ -122,14 +122,17 @@ fn relaunch_elevated(image_arg: Option<&PathBuf>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let exe = std::env::current_exe()?;
+        let uid = unsafe { libc::getuid() };
         let script = match image_arg {
             Some(img) => format!(
-                "do shell script \"\\\"{}\\\" \\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                "do shell script \"SUDO_UID={} \\\"{}\\\" \\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                uid,
                 exe.display(),
                 img.display()
             ),
             None => format!(
-                "do shell script \"\\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                "do shell script \"SUDO_UID={} \\\"{}\\\" > /dev/null 2>&1 &\" with administrator privileges",
+                uid,
                 exe.display()
             ),
         };
@@ -509,7 +512,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.5.0 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.5.1 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -602,7 +605,7 @@ impl BootLiteApp {
             Err(e) => {
                 push_log(
                     &self.logs,
-                    format!("[WARN] Could not inspect image header: {}", e),
+                    format!("[WARN] Could not inspect image header: {:#}", e),
                 );
                 self.image_meta = None;
             }
@@ -1038,7 +1041,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.5.0",
+                                "v0.5.1",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
