@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="boltGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="pillGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#064e3b"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="340" rx="22" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="2"/>
+  <line x1="0" y1="85" x2="1200" y2="85" stroke="#1e293b" stroke-width="1" stroke-dasharray="6,6" opacity="0.5"/>
+  <line x1="0" y1="255" x2="1200" y2="255" stroke="#1e293b" stroke-width="1" stroke-dasharray="6,6" opacity="0.5"/>
+  <g transform="translate(85, 78)">
+    <rect width="96" height="96" rx="24" fill="url(#boltGrad)" stroke="#93c5fd" stroke-width="2"/>
+    <polygon points="54,18 26,52 46,52 40,78 70,44 50,44" fill="#ffffff"/>
+  </g>
+  <text x="205" y="128" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="54" font-weight="800" fill="#f8fafc" letter-spacing="-1">BootLite</text>
+  <rect x="435" y="92" width="88" height="34" rx="8" fill="#1e3a8a" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="479" y="115" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="17" font-weight="700" fill="#60a5fa" text-anchor="middle">v0.6.1</text>
+  <text x="205" y="166" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="21" font-weight="500" fill="#94a3b8">
+    Cross-Platform Raw Hardware USB Flasher, Windows 10/11 UEFI &amp; AutoPilot Studio
+  </text>
+  <g transform="translate(85, 215)">
+    <rect x="0" y="0" width="215" height="40" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text x="107" y="25" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#f8fafc" text-anchor="middle">⚡ ~4 MB Native Rust</text>
+    <rect x="230" y="0" width="255" height="40" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text x="357" y="25" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#60a5fa" text-anchor="middle">🪟 Windows 10/11 Auto-UEFI</text>
+    <rect x="500" y="0" width="275" height="40" rx="10" fill="url(#pillGreen)" stroke="#10b981" stroke-width="1.5"/>
+    <text x="637" y="25" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#ecfdf5" text-anchor="middle">🏢 Intune AutoPilot CSV Extractor</text>
+    <rect x="790" y="0" width="240" height="40" rx="10" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+    <text x="910" y="25" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#34d399" text-anchor="middle">🛡️ ~3s Fast Hardware Verify</text>
+  </g>
+  <text x="85" y="302" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="600" fill="#64748b">
+    TARGETS: macOS (Apple Silicon)  •  Windows 10/11 (x64 Static Portable)  •  Linux (x86_64 GUI + CLI)
+  </text>
+</svg>

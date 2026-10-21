@@ -1,28 +1,61 @@
-# ⚡ BootLite (`v0.6.1`)
+<div align="center">
 
-**Cross-Platform Raw Hardware USB Flasher, Windows 10/11 Unattended & AutoPilot Studio, and SHA-256 Verifier**
+<img src="assets/banner.svg" alt="BootLite Hero Banner" width="100%"/>
 
-*Built in 100% Native Rust (`bootlite-core`, `bootlite-gui`, `bootlite-cli`) for macOS, Windows, and Linux.*
+<br/>
 
-[![Release](https://img.shields.io/badge/release-v0.6.1-3b82f6?style=flat-square)](https://github.com/NR3009/bootlite/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=flat-square)](#download-pre-built-binaries)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Latest Release](https://img.shields.io/badge/release-v0.6.1-2563eb?style=for-the-badge&logo=github)](https://github.com/NR3009/bootlite/releases)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=for-the-badge)](#downloads)
+[![Rust](https://img.shields.io/badge/built%20with-100%25%20Native%20Rust-f97316?style=for-the-badge&logo=rust)](https://github.com/NR3009/bootlite)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6366f1?style=for-the-badge)](https://github.com/NR3009/bootlite/blob/main/LICENSE)
+
+<p align="center">
+  <a href="#downloads"><b>⬇️ Download Binaries</b></a> •
+  <a href="#comparison"><b>⚡ Comparison</b></a> •
+  <a href="#autopilot-studio"><b>🏢 AutoPilot & Unattended Studio</b></a> •
+  <a href="#verification"><b>🔍 Fast Verify (~3s)</b></a> •
+  <a href="#cli"><b>💻 CLI</b></a>
+</p>
+
+</div>
 
 ---
 
-## 🚀 How BootLite Compares to Other Popular Tools
+<a id="downloads"></a>
+## ⬇️ One-Click Downloads (`v0.6.1`)
 
-Most USB utilities force a compromise: **Rufus** is fast and supports Windows ISOs, but is Windows-only. **balenaEtcher** runs across OSes, but bundles a ~150 MB Electron runtime, cannot build bootable Windows 10/11 USBs, and forces a slow 100% read-back pass. **Ventoy** uses a custom bootloader shim that can trigger Secure Boot blocks on locked enterprise laptops.
+All release binaries are built automatically via GitHub Actions CI. You can also browse all versions on the [**GitHub Releases Page**](https://github.com/NR3009/bootlite/releases).
 
-**BootLite (`~4 MB` single binary)** combines native cross-platform raw flashing, clean UEFI Windows 10/11 media creation, unattended `autounattend.xml` customization, and automated **Windows AutoPilot Hardware Hash extraction** in a single native Rust studio:
+| Operating System | Package Format | Direct Download Link |
+| :--- | :--- | :--- |
+| 🍎 **macOS** *(Apple Silicon M1/M2/M3/M4)* | `.dmg` Disk Image (`BootLite.app`) | [**`BootLite-macOS-AppleSilicon.dmg`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-macOS-AppleSilicon.dmg) |
+| 🪟 **Windows 10 / 11** *(x64 Studio GUI)* | Standalone Portable `.exe` *(0 DLL deps)* | [**`BootLite-Windows-x86_64-Portable.exe`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-Windows-x86_64-Portable.exe) |
+| 🪟 **Windows 10 / 11** *(x64 Headless CLI)* | Standalone CLI `.exe` | [**`bootlite-cli-Windows-x86_64.exe`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/bootlite-cli-Windows-x86_64.exe) |
+| 🐧 **Linux** *(x86_64 GUI + CLI)* | `.tar.gz` Archive (`bootlite-gui` + `bootlite-cli`) | [**`BootLite-Linux-x86_64.tar.gz`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-Linux-x86_64.tar.gz) |
+| 🔐 **SHA-256 Checksums** | Release Verification Manifest | [**`SHA256SUMS.txt`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/SHA256SUMS.txt) |
+
+> **🍎 macOS First-Launch Note:** Run this once after dragging `BootLite.app` to `/Applications`:
+> ```bash
+> xattr -cr /Applications/BootLite.app
+> ```
+
+---
+
+<a id="comparison"></a>
+## ⚡ How BootLite Compares
+
+Traditional USB utilities force a compromise: **Rufus** is fast and supports Windows ISOs, but is Windows-only. **balenaEtcher** runs across operating systems, but bundles a ~150 MB Electron/Chromium runtime, cannot build bootable Windows 10/11 USBs, and forces a slow 100% read-back pass. **Ventoy** relies on a custom bootloader shim that can trigger Secure Boot blocks on locked enterprise laptops.
+
+**BootLite (`~4 MB` single binary)** unifies native cross-platform raw flashing, standard UEFI Windows 10/11 media creation, zero-prompt disk format boot, and **Microsoft Intune AutoPilot hardware hash extraction** into a single native Rust application:
 
 | Capability | ⚡ BootLite `v0.6.1` | Rufus `v4.x` | balenaEtcher `v2.x` | Ventoy `v1.x` |
 | :--- | :---: | :---: | :---: | :---: |
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes | ⚠️ Windows / Linux |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot | ✅ Multi-ISO Shim |
-| **Windows AutoPilot Hardware Hash Extractor (`\AutoPilot\`)** | ✅ Built-in (Saves Intune CSV to USB) | ❌ No | ❌ No | ❌ No |
+| **Jump Straight to Disk Format (Skip Lang/Key/Edition/EULA)** | ✅ 1-Click Pre-Flash Selector | ❌ No | ❌ No | ❌ No |
+| **Windows AutoPilot Hardware Hash Extractor (`\AutoPilot\`)** | ✅ Saves Intune CSV (`AutoPilotHWID_<Serial>.csv`) | ❌ No | ❌ No | ❌ No |
 | **Windows 10 / 11 Unattended Setup Studio (`autounattend.xml`)** | ✅ Basic, De-Bloat & Live XML Preview | ✅ Basic Dialog | ❌ No | ⚠️ Manual Plugin |
-| **Standard Native UEFI Boot (No Custom Shim / MOK Required)** | ✅ 100% Native Boot | ✅ Yes | ✅ Yes | ❌ Custom Bootloader |
+| **Standard Native UEFI Boot (No Custom Shim Required)** | ✅ 100% Native Boot | ✅ Yes | ✅ Yes | ❌ Custom Bootloader |
 | **4 MB / 8 MB High-Throughput Burst Engine** | ✅ Full USB Bus Speed | ✅ Yes | ⚠️ Slow Full Verify | N/A (File Copy) |
 | **Smart Verification (`Fast ~3s` / `Full 100%` / `Off`)** | ✅ 3 Selectable Modes | ✅ Optional | ❌ Mandatory Slow Read | ❌ No |
 | **On-the-Fly `.xz` (Multi-Stream), `.zst`, `.bz2`, `.gz`** | ✅ Built-in Pure Rust | ✅ Yes | ✅ Yes | ❌ Uncompressed ISO |
@@ -34,74 +67,43 @@ Most USB utilities force a compromise: **Rufus** is fast and supports Windows IS
 
 ---
 
-## 📦 Download Pre-Built Binaries
+<a id="autopilot-studio"></a>
+## 🏢 Windows 10/11 Unattended & AutoPilot Studio
 
-Download the latest release directly from [**GitHub Releases (`v0.6.1`)**](https://github.com/NR3009/bootlite/releases/latest):
+When you load any Windows 10 or Windows 11 ISO into **Step 1**, BootLite automatically unlocks its enterprise deployment controls:
 
-* 🍎 **macOS (Apple Silicon):** [`BootLite-macOS-AppleSilicon.dmg`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg)
-* 💻 **Windows 10 / 11 (x64 Portable — Zero DLL Dependencies):** [`BootLite-Windows-x86_64-Portable.exe`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe)
-* 🐧 **Linux (x86_64 Tarball — GUI + CLI):** [`BootLite-Linux-x86_64.tar.gz`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Linux-x86_64.tar.gz)
-* 🔐 **Release Checksums:** [`SHA256SUMS.txt`](https://github.com/NR3009/bootlite/releases/latest/download/SHA256SUMS.txt)
+### 1. Jump Straight to Disk Format & Pre-Flash Edition Selector
+* **Skip Pre-Install Wizard Screens:** Automatically pre-answers the Windows Setup Language, Time/Currency, Keyboard, Product Key prompt (*"I don't have a product key"*), and License Agreement (EULA) so booting from BIOS lands **directly on the Drive Partition / Format screen**.
+* **One-Click Edition Bar (`Pro` / `Home` / `Home SL` / `Enterprise` / `Ask Me`):** Pick the target Windows edition right on the main card before clicking Flash.
 
-### 🍎 macOS First-Launch Note
-Because `BootLite.app` is open-source and not signed with a paid Apple Developer ID certificate, macOS Gatekeeper may show a prompt on first launch. Run this once after dragging `BootLite.app` to `/Applications`:
+### 2. Automatic Laptop AutoPilot Hardware Hash Extractor (`\AutoPilot\`)
+* BootLite provisions an **`AutoPilot`** folder directly on the USB drive containing `Extract-AutoPilotHash.ps1` and `Extract-AutoPilotHash.cmd`.
+* Queries the laptop's WMI `root/cimv2/mdm/dmmap:MDM_DevDetail_Ext01` 4K Hardware Hash, BIOS Serial Number, and Windows Product ID **100% offline** (no internet or PowerShell Gallery required).
+* Writes a single clean, deduplicated Microsoft Intune import file per laptop:
+  ```text
+  \AutoPilot\AutoPilotHWID_<SerialNumber>.csv
+  ```
 
-```bash
-xattr -cr /Applications/BootLite.app
-```
-
----
-
-## 🏢 Windows AutoPilot Hardware Hash Extractor & Unattended Studio
-
-When you select a Windows 10 or Windows 11 ISO, BootLite automatically unlocks the **Windows Setup & AutoPilot Studio**:
-
-1. **Automatic Laptop Hardware Hash Extraction (`\AutoPilot\` Folder on USB):**
-   * BootLite provisions an `AutoPilot` directory directly on the USB drive containing `Extract-AutoPilotHash.ps1` and `Extract-AutoPilotHash.cmd`.
-   * Queries WMI `root/cimv2/mdm/dmmap:MDM_DevDetail_Ext01` and `Win32_BIOS` **100% offline** (no internet or PowerShell Gallery required) and saves:
-     * `\AutoPilot\AutoPilotHWID_<SerialNumber>_<Hostname>.csv` (per-laptop hash file ready for Microsoft Intune import)
-     * `\AutoPilot\AutoPilotHWID_Fleet.csv` (appends hashes across multiple laptops onto the same USB stick)
-   * Runs automatically during unattended Windows setup, or can be triggered manually on any laptop by running `\AutoPilot\Extract-AutoPilotHash.cmd`.
-2. **Unattended Setup Studio (`autounattend.xml`):**
-   * **Basic Setup:** Bypass Windows 11 TPM 2.0, Secure Boot, and 4 GB RAM checks; bypass mandatory online Microsoft Account (`OOBE\BYPASSNRO`); pre-create a Local Administrator account with auto-logon; disable OOBE privacy questions and automatic BitLocker encryption.
-   * **Advanced & De-Bloat:** Set custom computer hostname and locale, disable Windows 11 Widgets and consumer bloatware, restore classic right-click context menus, show file extensions, and execute custom first-logon commands.
-   * **Live XML Preview:** Inspect, copy, or export the generated `autounattend.xml` directly from the UI.
+### 3. Hardware Bypasses, Local Account & De-Bloat (`autounattend.xml`)
+* **Hardware Bypass:** Removes Windows 11 requirements for TPM 2.0, Secure Boot, and 4 GB+ RAM (`LabConfig`).
+* **Offline Account Creation:** Bypasses mandatory Microsoft Account sign-in (`OOBE\BYPASSNRO`) and optionally pre-creates a Local Administrator account with auto-logon.
+* **System Clean-Up:** Disables automatic BitLocker encryption, skips OOBE privacy/telemetry prompts, disables consumer bloatware/widgets, restores the classic right-click context menu, and provides a **Live XML Preview** tab with 1-click export.
 
 ---
 
-## 🔍 Verification Modes (`Fast` vs `Full` vs `Off`) & Partition Schemes
+<a id="verification"></a>
+## 🔍 Verification Modes & Partition Schemes
 
-### 1. Verification Selector (`Verify:`)
-* **`Fast (~3s)` (Default — Recommended):**
-  * Flushes the physical USB hardware controller cache (`F_FULLFSYNC` / `FlushFileBuffers` / `BLKFLSBUF`).
-  * **For Linux / Raw Images:** Verifies **100% of the 4 MB Sector-0 Boot Record (MBR/GPT)** + **32 evenly spaced 64 KB cryptographic sample blocks** across the drive (including tail sectors to catch counterfeit/fake-capacity USB drives).
-  * **For Windows 10/11 ISOs:** Verifies all critical UEFI bootloaders (`bootx64.efi`, `bootmgr`, `BCD`, `setup.exe`) and spot-checks **512 KB Head, Middle, and Tail slices** of `sources/boot.wim` and `sources/install.wim`.
-* **`Full (100%)`:**
-  * Reads back **every single written sector/file (100% of the image)** from physical USB NAND flash and verifies its SHA-256 digest against the source stream.
-* **`Off`:**
-  * Flushes hardware caches, commits the boot record, and completes immediately after writing.
-
-### 2. Partition Scheme Selector (`Scheme:`)
-* **`Auto` (Default):** Preserves built-in `ISOHybrid` (`MBR + GPT`) tables on Linux/BSD images and automatically picks the optimal UEFI partition table when building a Windows 10/11 USB.
-* **`GPT`:** Forces a **GUID Partition Table** layout for modern UEFI systems.
-* **`MBR`:** Forces a **Master Boot Record (BIOS / UEFI-CSM)** layout for legacy motherboards or dual BIOS/UEFI boot compatibility.
+| Control | Options | Description |
+| :--- | :--- | :--- |
+| **Verify Mode** | **`Fast (~3s)`** *(Default)* | Flushes physical USB controller caches and verifies **100% of the 4 MB Sector-0 Boot Record (MBR/GPT)** + **32 evenly spaced 64 KB cryptographic sample blocks** across the drive (or all UEFI `.efi` bootloaders + 512 KB Head/Mid/Tail slices of `boot.wim` & `install.wim` on Windows ISOs). |
+| | **`Full (100%)`** | Reads back every single written sector/file across the entire USB drive from physical NAND flash and verifies its full SHA-256 digest. |
+| | **`Off`** | Flushes hardware buffers, commits the boot record, and finishes immediately after writing. |
+| **Scheme** | **`Auto` / `GPT` / `MBR`** | Preserves `ISOHybrid` tables on Linux images and lets you choose between `GPT` (modern UEFI) and `MBR` (BIOS / UEFI-CSM) for Windows ISO builds and ExFAT USB formatting. |
 
 ---
 
-## 🛡️ Architecture & Hardware Safety Guarantees
-
-1. **System Disk Lockout (3-OS Kernel Protection):**
-   * **macOS:** Blocks internal `Apple Fabric` NVMe drives, synthesized APFS containers, and `/dev/disk0`, while supporting external USB drives and built-in SDXC card slots.
-   * **Windows:** Queries Win32 `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` and blocks `PhysicalDrive0` and any physical disk hosting `C:`.
-   * **Linux:** Inspects `/sys/block` and `/proc/mounts` directly in pure Rust (`under 0.5 ms`) and locks out any device backing `/`, `/boot`, `/boot/efi`, `/home`, `/usr`, `/var`, or `/nix`.
-2. **Automatic Windows 10/11 UDF ISO Builder (`windows_iso.rs`):**
-   * Automatically detects retail and Insider/UUPDump Microsoft Windows 10/11 ISOs.
-   * Streams files using an **8 MB burst buffer**, creating a **Dual-Partition UEFI + Data layout** (`900 MB` `WINBOOT` FAT32 partition for UEFI `boot.wim` + remaining capacity `WINSETUP` NTFS/ExFAT partition for `install.wim`) when `install.wim` exceeds the 4 GB FAT32 file limit.
-3. **Auto-Clean Partition Unlock on Windows (Zero `os error 5`):**
-   * Automatically dismounts open Explorer/Defender handles, re-locks volumes, and strips stubborn pre-existing partition layouts before opening `PhysicalDriveN` so `Access is denied (os error 5)` never occurs.
-
----
-
+<a id="cli"></a>
 ## 💻 Command-Line Interface (`bootlite-cli`)
 
 ```bash
@@ -126,18 +128,6 @@ sudo bootlite-cli reset --drive disk4 --label BOOTLITE --scheme auto
 
 ---
 
-## 🛠️ Building & Testing From Source
+## 🤝 Contributing & License
 
-```bash
-git clone https://github.com/NR3009/bootlite.git
-cd bootlite
-
-# Run the automated unit test suite
-cargo test --workspace
-
-# Launch the Studio GUI
-cargo run --release -p bootlite-gui
-
-# Build the macOS .app bundle and .dmg installer
-./scripts/bundle-macos.sh
-```
+Contributions, bug reports, and feature requests are welcome! Please read [**CONTRIBUTING.md**](https://github.com/NR3009/bootlite/blob/main/CONTRIBUTING.md) before submitting a Pull Request. Licensed under the [**MIT License**](https://github.com/NR3009/bootlite/blob/main/LICENSE).
