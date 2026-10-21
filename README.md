@@ -28,11 +28,11 @@ All release binaries are built automatically via GitHub Actions CI. You can also
 
 | Operating System | Package Format | Direct Download Link |
 | :--- | :--- | :--- |
-| 🍎 **macOS** *(Apple Silicon M1/M2/M3/M4)* | `.dmg` Disk Image (`BootLite.app`) | [**`BootLite-macOS-AppleSilicon.dmg`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-macOS-AppleSilicon.dmg) |
-| 🪟 **Windows 10 / 11** *(x64 Studio GUI)* | Standalone Portable `.exe` *(0 DLL deps)* | [**`BootLite-Windows-x86_64-Portable.exe`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-Windows-x86_64-Portable.exe) |
-| 🪟 **Windows 10 / 11** *(x64 Headless CLI)* | Standalone CLI `.exe` | [**`bootlite-cli-Windows-x86_64.exe`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/bootlite-cli-Windows-x86_64.exe) |
-| 🐧 **Linux** *(x86_64 GUI + CLI)* | `.tar.gz` Archive (`bootlite-gui` + `bootlite-cli`) | [**`BootLite-Linux-x86_64.tar.gz`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/BootLite-Linux-x86_64.tar.gz) |
-| 🔐 **SHA-256 Checksums** | Release Verification Manifest | [**`SHA256SUMS.txt`**](https://github.com/NR3009/bootlite/releases/download/v0.6.1/SHA256SUMS.txt) |
+| 🍎 **macOS** *(Apple Silicon M1/M2/M3/M4)* | `.dmg` Disk Image (`BootLite.app`) | [**`BootLite-macOS-AppleSilicon.dmg`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg) |
+| 🪟 **Windows 10 / 11** *(x64 Studio GUI)* | Standalone Portable `.exe` *(0 DLL deps)* | [**`BootLite-Windows-x86_64-Portable.exe`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe) |
+| 🪟 **Windows 10 / 11** *(x64 Headless CLI)* | Standalone CLI `.exe` | [**`bootlite-cli-Windows-x86_64.exe`**](https://github.com/NR3009/bootlite/releases/latest/download/bootlite-cli-Windows-x86_64.exe) |
+| 🐧 **Linux** *(x86_64 GUI + CLI)* | `.tar.gz` Archive (`bootlite-gui` + `bootlite-cli`) | [**`BootLite-Linux-x86_64.tar.gz`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Linux-x86_64.tar.gz) |
+| 🔐 **SHA-256 Checksums** | Release Verification Manifest | [**`SHA256SUMS.txt`**](https://github.com/NR3009/bootlite/releases/latest/download/SHA256SUMS.txt) |
 
 > **🍎 macOS First-Launch Note:** Run this once after dragging `BootLite.app` to `/Applications`:
 > ```bash
