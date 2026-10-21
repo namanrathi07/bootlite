@@ -4,10 +4,10 @@
 
 <br/>
 
-[![Latest Release](https://img.shields.io/badge/release-v0.6.1-2563eb?style=for-the-badge&logo=github)](https://github.com/NR3009/bootlite/releases)
+[![Latest Release](https://img.shields.io/badge/release-v0.6.1-2563eb?style=for-the-badge&logo=github)](https://github.com/namanrathi07/bootlite/releases)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=for-the-badge)](#downloads)
-[![Rust](https://img.shields.io/badge/built%20with-100%25%20Native%20Rust-f97316?style=for-the-badge&logo=rust)](https://github.com/NR3009/bootlite)
-[![License: MIT](https://img.shields.io/badge/license-MIT-6366f1?style=for-the-badge)](https://github.com/NR3009/bootlite/blob/main/LICENSE)
+[![Rust](https://img.shields.io/badge/built%20with-100%25%20Native%20Rust-f97316?style=for-the-badge&logo=rust)](https://github.com/namanrathi07/bootlite)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6366f1?style=for-the-badge)](https://github.com/namanrathi07/bootlite/blob/main/LICENSE)
 
 <p align="center">
   <a href="#downloads"><b>⬇️ Download Binaries</b></a> •
@@ -24,15 +24,15 @@
 <a id="downloads"></a>
 ## ⬇️ One-Click Downloads (`v0.6.1`)
 
-All release binaries are built automatically via GitHub Actions CI. You can also browse all versions on the [**GitHub Releases Page**](https://github.com/NR3009/bootlite/releases).
+All release binaries are built automatically via GitHub Actions CI. You can also browse all versions on the [**GitHub Releases Page**](https://github.com/namanrathi07/bootlite/releases).
 
 | Operating System | Package Format | Direct Download Link |
 | :--- | :--- | :--- |
-| 🍎 **macOS** *(Apple Silicon M1/M2/M3/M4)* | `.dmg` Disk Image (`BootLite.app`) | [**`BootLite-macOS-AppleSilicon.dmg`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg) |
-| 🪟 **Windows 10 / 11** *(x64 Studio GUI)* | Standalone Portable `.exe` *(0 DLL deps)* | [**`BootLite-Windows-x86_64-Portable.exe`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe) |
-| 🪟 **Windows 10 / 11** *(x64 Headless CLI)* | Standalone CLI `.exe` | [**`bootlite-cli-Windows-x86_64.exe`**](https://github.com/NR3009/bootlite/releases/latest/download/bootlite-cli-Windows-x86_64.exe) |
-| 🐧 **Linux** *(x86_64 GUI + CLI)* | `.tar.gz` Archive (`bootlite-gui` + `bootlite-cli`) | [**`BootLite-Linux-x86_64.tar.gz`**](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Linux-x86_64.tar.gz) |
-| 🔐 **SHA-256 Checksums** | Release Verification Manifest | [**`SHA256SUMS.txt`**](https://github.com/NR3009/bootlite/releases/latest/download/SHA256SUMS.txt) |
+| 🍎 **macOS** *(Apple Silicon M1/M2/M3/M4)* | `.dmg` Disk Image (`BootLite.app`) | [**`BootLite-macOS-AppleSilicon.dmg`**](https://github.com/namanrathi07/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg) |
+| 🪟 **Windows 10 / 11** *(x64 Studio GUI)* | Standalone Portable `.exe` *(0 DLL deps)* | [**`BootLite-Windows-x86_64-Portable.exe`**](https://github.com/namanrathi07/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe) |
+| 🪟 **Windows 10 / 11** *(x64 Headless CLI)* | Standalone CLI `.exe` | [**`bootlite-cli-Windows-x86_64.exe`**](https://github.com/namanrathi07/bootlite/releases/latest/download/bootlite-cli-Windows-x86_64.exe) |
+| 🐧 **Linux** *(x86_64 GUI + CLI)* | `.tar.gz` Archive (`bootlite-gui` + `bootlite-cli`) | [**`BootLite-Linux-x86_64.tar.gz`**](https://github.com/namanrathi07/bootlite/releases/latest/download/BootLite-Linux-x86_64.tar.gz) |
+| 🔐 **SHA-256 Checksums** | Release Verification Manifest | [**`SHA256SUMS.txt`**](https://github.com/namanrathi07/bootlite/releases/latest/download/SHA256SUMS.txt) |
 
 > **🍎 macOS First-Launch Note:** Run this once after dragging `BootLite.app` to `/Applications`:
 > ```bash
@@ -130,4 +130,4 @@ sudo bootlite-cli reset --drive disk4 --label BOOTLITE --scheme auto
 
 ## 🤝 Contributing & License
 
-Contributions, bug reports, and feature requests are welcome! Please read [**CONTRIBUTING.md**](https://github.com/NR3009/bootlite/blob/main/CONTRIBUTING.md) before submitting a Pull Request. Licensed under the [**MIT License**](https://github.com/NR3009/bootlite/blob/main/LICENSE).
+Contributions, bug reports, and feature requests are welcome! Please read [**CONTRIBUTING.md**](https://github.com/namanrathi07/bootlite/blob/main/CONTRIBUTING.md) before submitting a Pull Request. Licensed under the [**MIT License**](https://github.com/namanrathi07/bootlite/blob/main/LICENSE).
