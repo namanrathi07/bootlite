@@ -1,8 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowsEdition {
+    Pro,
+    Home,
+    HomeSingleLanguage,
+    Enterprise,
+    Education,
+    PromptUser,
+}
+
+impl WindowsEdition {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Pro => "Pro",
+            Self::Home => "Home",
+            Self::HomeSingleLanguage => "Home SL",
+            Self::Enterprise => "Enterprise",
+            Self::Education => "Education",
+            Self::PromptUser => "Ask Me",
+        }
+    }
+
+    pub fn full_label(self) -> &'static str {
+        match self {
+            Self::Pro => "Windows 10/11 Pro (Auto-Select)",
+            Self::Home => "Windows 10/11 Home (Auto-Select)",
+            Self::HomeSingleLanguage => "Windows 10/11 Home Single Language",
+            Self::Enterprise => "Windows 10/11 Enterprise (Auto-Select)",
+            Self::Education => "Windows 10/11 Education (Auto-Select)",
+            Self::PromptUser => "Ask Me During Setup (Manual Edition Selection)",
+        }
+    }
+
+    /// Official Microsoft Generic Setup Keys (KMS/Retail setup selection keys).
+    /// These tell Windows Setup which edition image to install so it skips the Edition prompt
+    /// and jumps straight to the Drive Format screen, without blocking OEM/Digital activation.
+    pub fn generic_setup_key(self) -> Option<&'static str> {
+        match self {
+            Self::Pro => Some("W269N-WFGWX-YVC9B-4J6C9-T83GX"),
+            Self::Home => Some("TX9XD-98N7V-6WMQ6-BX7FG-H8Q99"),
+            Self::HomeSingleLanguage => Some("7HNRX-D7KGG-3K4RQ-4WPJ4-YTDFH"),
+            Self::Enterprise => Some("NPPR9-FWDCX-D2C8J-H872K-2YT43"),
+            Self::Education => Some("NW6C2-QMPVW-D7KKK-3GKT6-VCFB2"),
+            Self::PromptUser => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowsUnattendConfig {
+    /// Enabled by default so Windows Setup skips pre-disk prompts and jumps straight to the Drive Format screen
     pub enabled: bool,
+    pub edition: WindowsEdition,
+    pub ui_language: String,
+    pub time_currency_locale: String,
+    pub keyboard_locale: String,
     // AutoPilot Hardware Hash Extraction to USB (\AutoPilot\)
     pub extract_autopilot_hash: bool,
     // Basic Setup Tweaks
@@ -16,7 +69,6 @@ pub struct WindowsUnattendConfig {
     pub auto_logon: bool,
     // Advanced & System Customization
     pub computer_name: String,
-    pub ui_language: String,
     pub remove_bloatware_widgets: bool,
     pub classic_context_menu_and_ext: bool,
     pub custom_firstlogon_cmd: String,
@@ -25,7 +77,11 @@ pub struct WindowsUnattendConfig {
 impl Default for WindowsUnattendConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
+            edition: WindowsEdition::Pro,
+            ui_language: "en-US".to_string(),
+            time_currency_locale: "en-IN".to_string(),
+            keyboard_locale: "en-US".to_string(),
             extract_autopilot_hash: true,
             bypass_hardware_checks: true,
             bypass_ms_account: true,
@@ -36,7 +92,6 @@ impl Default for WindowsUnattendConfig {
             local_password: String::new(),
             auto_logon: true,
             computer_name: String::new(),
-            ui_language: "en-US".to_string(),
             remove_bloatware_widgets: true,
             classic_context_menu_and_ext: true,
             custom_firstlogon_cmd: String::new(),
@@ -54,24 +109,22 @@ fn xml_escape(input: &str) -> String {
 }
 
 /// Generates the standalone PowerShell script placed inside `\AutoPilot\Extract-AutoPilotHash.ps1` on the USB drive.
-/// It extracts the laptop's 4K Hardware Hash from `root/cimv2/mdm/dmmap:MDM_DevDetail_Ext01` (100% offline-capable)
-/// and writes Intune-compatible CSV files into the USB drive's `\AutoPilot\` directory.
+/// Saves one single clean Intune CSV per laptop (`AutoPilotHWID_<SerialNumber>.csv`) so hostname changes never duplicate files.
 pub fn generate_autopilot_ps1_script() -> &'static str {
     r#"# BootLite Windows AutoPilot Hardware Hash Extractor
-# Saves Microsoft Intune / AutoPilot Hardware Hash CSV directly to the USB \AutoPilot\ folder.
+# Saves a single Microsoft Intune Hardware Hash CSV (AutoPilotHWID_<SerialNumber>.csv) in the USB \AutoPilot\ folder.
 
 $ErrorActionPreference = 'Stop'
 
 try {
     # 1. Locate the target AutoPilot output directory on the USB drive
-    $OutDir = $PSScriptRoot
-    if ([string]::IsNullOrWhiteSpace($OutDir) -or -not (Test-Path -LiteralPath $OutDir)) {
-        $UsbDisk = Get-Volume | Where-Object { $_.DriveLetter -ne $null } | ForEach-Object {
-            $Candidate = "$($_.DriveLetter):\AutoPilot"
-            if (Test-Path -LiteralPath $Candidate) { $Candidate }
+    $OutDir =$PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($OutDir) -or -not (Test-Path -LiteralPath$OutDir)) {
+        $UsbDisk = Get-Volume \vert{} Where-Object {$_.DriveLetter -ne $null } \vert{} ForEach-Object {$Candidate = "$($_.DriveLetter):\AutoPilot"
+            if (Test-Path -LiteralPath $Candidate) {$Candidate }
         } | Select-Object -First 1
         if ($UsbDisk) {
-            $OutDir = $UsbDisk
+            $OutDir =$UsbDisk
         } else {
             $OutDir = "C:\AutoPilot"
         }
@@ -84,7 +137,6 @@ try {
     $Bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue
     $Serial = if ($Bios -and $Bios.SerialNumber) { ($Bios.SerialNumber).Trim() } else { "UNKNOWN_SERIAL" }
     $SafeSerial = ($Serial -replace '[^a-zA-Z0-9_-]', '_')
-    $HostName = if ($env:COMPUTERNAME) { ($env:COMPUTERNAME -replace '[^a-zA-Z0-9_-]', '_') } else { "LAPTOP" }
 
     # 3. Query Windows Product ID
     $ProdId = ""
@@ -97,29 +149,18 @@ try {
     $HwHash = if ($DevDetail -and $DevDetail.DeviceHardwareData) { ($DevDetail.DeviceHardwareData).Trim() } else { "" }
 
     if ([string]::IsNullOrWhiteSpace($HwHash)) {
-        Write-Warning "MDM_DevDetail_Ext01 Hardware Hash is not yet populated in WMI (Note: Run from full Windows OS or OOBE Shift+F10, not WinPE)."
+        Write-Warning "MDM_DevDetail_Ext01 Hardware Hash is not yet populated in WMI."
         exit 1
     }
 
     $CsvHeader = "Device Serial Number,Windows Product ID,Hardware Hash"
     $CsvRow    = "$Serial,$ProdId,$HwHash"
 
-    # 5. Write per-device CSV file into \AutoPilot\
-    $DeviceFile = Join-Path $OutDir "AutoPilotHWID_${SafeSerial}_${HostName}.csv"
-    Set-Content -LiteralPath $DeviceFile -Value @($CsvHeader, $CsvRow) -Encoding Ascii -Force
+    # 5. Write ONE clean Intune-ready CSV file named by Serial Number (overwrites if run twice on same laptop)
+    $DeviceFile = Join-Path $OutDir "AutoPilotHWID_${SafeSerial}.csv"
+    Set-Content -LiteralPath $DeviceFile -Value @($CsvHeader,$CsvRow) -Encoding Ascii -Force
 
-    # 6. Append to master Fleet CSV file (\AutoPilot\AutoPilotHWID_Fleet.csv) if not already recorded
-    $FleetFile = Join-Path $OutDir "AutoPilotHWID_Fleet.csv"
-    if (-not (Test-Path -LiteralPath $FleetFile)) {
-        Set-Content -LiteralPath $FleetFile -Value $CsvHeader -Encoding Ascii -Force
-    }
-    $Existing = Get-Content -LiteralPath $FleetFile -ErrorAction SilentlyContinue
-    if (-not ($Existing | Where-Object { $_ -like "$Serial,*" })) {
-        Add-Content -LiteralPath $FleetFile -Value $CsvRow -Encoding Ascii
-    }
-
-    Write-Host "[OK] AutoPilot Hardware Hash saved to: $DeviceFile" -ForegroundColor Green
-    Write-Host "[OK] Fleet CSV updated:                $FleetFile" -ForegroundColor Green
+    Write-Host "[OK] Intune AutoPilot CSV saved to: $DeviceFile" -ForegroundColor Green
     exit 0
 } catch {
     Write-Error "Failed to extract AutoPilot Hardware Hash: $_"
@@ -139,11 +180,11 @@ pub fn generate_autopilot_cmd_launcher() -> &'static str {
      powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0Extract-AutoPilotHash.ps1\"\r\n\
      if %ERRORLEVEL% EQU 0 (\r\n\
          echo.\r\n\
-         echo [SUCCESS] Laptop Hardware Hash CSV saved inside %~dp0\r\n\
+         echo [SUCCESS] Intune Hardware Hash CSV saved inside %~dp0\r\n\
      ) else (\r\n\
          echo.\r\n\
-         echo [WARN] Could not extract hash. Make sure you run this as Administrator\r\n\
-         echo        inside Windows Setup OOBE ^(Shift+F10^) or full Windows desktop.\r\n\
+         echo [WARN] Could not extract hash. Run as Administrator inside Windows OOBE\r\n\
+         echo        ^(Shift+F10^) or full Windows desktop.\r\n\
      )\r\n\
      if \"%1\" NEQ \"--silent\" pause\r\n"
 }
@@ -159,6 +200,7 @@ impl WindowsUnattendConfig {
             count += 1;
         }
         if self.enabled {
+            count += 1; // Jump straight to Disk Format (skip Language/Key/EULA)
             if self.bypass_hardware_checks {
                 count += 1;
             }
@@ -191,10 +233,20 @@ impl WindowsUnattendConfig {
     }
 
     pub fn generate_xml(&self) -> String {
-        let lang = if self.ui_language.trim().is_empty() {
+        let ui_lang = if self.ui_language.trim().is_empty() {
             "en-US".to_string()
         } else {
             xml_escape(self.ui_language.trim())
+        };
+        let locale = if self.time_currency_locale.trim().is_empty() {
+            ui_lang.clone()
+        } else {
+            xml_escape(self.time_currency_locale.trim())
+        };
+        let kbd = if self.keyboard_locale.trim().is_empty() {
+            ui_lang.clone()
+        } else {
+            xml_escape(self.keyboard_locale.trim())
         };
 
         let mut pe_commands = Vec::new();
@@ -215,9 +267,8 @@ impl WindowsUnattendConfig {
 
         let mut specialize_commands = Vec::new();
         if self.extract_autopilot_hash {
-            // Automatically locate the USB drive's \AutoPilot\Extract-AutoPilotHash.ps1 during specialize pass and run it
             specialize_commands.push(
-                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { $s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { & $s } }""#.to_string(),
+                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } \vert{} ForEach-Object {$s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { &$s } }""#.to_string(),
             );
         }
         if self.enabled {
@@ -243,9 +294,8 @@ impl WindowsUnattendConfig {
 
         let mut firstlogon_commands = Vec::new();
         if self.extract_autopilot_hash {
-            // Also run at FirstLogon as a guaranteed fallback in case WMI MDM_DevDetail_Ext01 initialized during OOBE
             firstlogon_commands.push(
-                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { $s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { & $s } }""#.to_string(),
+                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } \vert{} ForEach-Object {$s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { &$s } }""#.to_string(),
             );
         }
         if self.enabled {
@@ -271,18 +321,28 @@ impl WindowsUnattendConfig {
         xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         xml.push_str("<unattend xmlns=\"urn:schemas-microsoft-com:unattend\" xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n");
 
-        // 1. windowsPE pass
+        // 1. windowsPE pass: Skips Language, Keyboard, Product Key, Edition & EULA -> Lands directly on the Drive Format screen!
         if self.enabled {
             xml.push_str("  <settings pass=\"windowsPE\">\n");
             xml.push_str("    <component name=\"Microsoft-Windows-International-Core-WinPE\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n");
-            xml.push_str(&format!("      <UILanguage>{}</UILanguage>\n", lang));
-            xml.push_str(&format!("      <UserLocale>{}</UserLocale>\n", lang));
-            xml.push_str(&format!("      <SystemLocale>{}</SystemLocale>\n", lang));
-            xml.push_str(&format!("      <InputLocale>{}</InputLocale>\n", lang));
+            xml.push_str("      <SetupUILanguage>\n");
+            xml.push_str(&format!("        <UILanguage>{}</UILanguage>\n", ui_lang));
+            xml.push_str("        <WillShowUI>OnError</WillShowUI>\n");
+            xml.push_str("      </SetupUILanguage>\n");
+            xml.push_str(&format!("      <UILanguage>{}</UILanguage>\n", ui_lang));
+            xml.push_str(&format!("      <UserLocale>{}</UserLocale>\n", locale));
+            xml.push_str(&format!("      <SystemLocale>{}</SystemLocale>\n", locale));
+            xml.push_str(&format!("      <InputLocale>{}</InputLocale>\n", kbd));
             xml.push_str("    </component>\n");
             xml.push_str("    <component name=\"Microsoft-Windows-Setup\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n");
             xml.push_str("      <UserData>\n");
             xml.push_str("        <AcceptEula>true</AcceptEula>\n");
+            xml.push_str("        <ProductKey>\n");
+            if let Some(gkey) = self.edition.generic_setup_key() {
+                xml.push_str(&format!("          <Key>{}</Key>\n", gkey));
+            }
+            xml.push_str("          <WillShowUI>OnError</WillShowUI>\n");
+            xml.push_str("        </ProductKey>\n");
             xml.push_str("      </UserData>\n");
             if !pe_commands.is_empty() {
                 xml.push_str("      <RunSynchronous>\n");
@@ -396,28 +456,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_autopilot_script_contains_intune_csv_columns() {
+    fn test_autopilot_script_creates_single_clean_csv() {
         let ps1 = generate_autopilot_ps1_script();
         assert!(ps1.contains("Device Serial Number,Windows Product ID,Hardware Hash"));
         assert!(ps1.contains("MDM_DevDetail_Ext01"));
-        assert!(ps1.contains("AutoPilotHWID_Fleet.csv"));
-
-        let cmd = generate_autopilot_cmd_launcher();
-        assert!(cmd.contains("Extract-AutoPilotHash.ps1"));
+        assert!(ps1.contains("AutoPilotHWID_${SafeSerial}.csv"));
+        assert!(!ps1.contains("AutoPilotHWID_Fleet.csv"));
     }
 
     #[test]
-    fn test_unattend_xml_generation_with_autopilot() {
-        let mut cfg = WindowsUnattendConfig::default();
-        cfg.enabled = true;
-        cfg.extract_autopilot_hash = true;
-        cfg.create_local_account = true;
-        cfg.local_username = "SysAdmin".to_string();
-
+    fn test_unattend_xml_skips_to_disk_format_screen() {
+        let cfg = WindowsUnattendConfig::default();
+        assert!(cfg.enabled);
         let xml = cfg.generate_xml();
+        assert!(xml.contains("<SetupUILanguage>"));
+        assert!(xml.contains("<WillShowUI>OnError</WillShowUI>"));
+        assert!(xml.contains("W269N-WFGWX-YVC9B-4J6C9-T83GX")); // Windows Pro Generic Setup Key
         assert!(xml.contains("BypassTPMCheck"));
-        assert!(xml.contains("BypassNRO"));
-        assert!(xml.contains("Extract-AutoPilotHash.ps1"));
-        assert!(xml.contains("<Name>SysAdmin</Name>"));
     }
 }

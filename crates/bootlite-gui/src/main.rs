@@ -4,7 +4,7 @@ use bootlite_core::{
     compute_image_sha256, eject_drive, flash_and_verify_with_unattend, inspect_image,
     is_image_on_drive, list_safe_usb_drives, normalize_sha256_input,
     reset_and_format_drive_with_scheme, windows_iso::WIN_ISO_OVERHEAD_BYTES, ImageMetadata,
-    PartitionScheme, UsbDrive, VerifyMode, WindowsUnattendConfig,
+    PartitionScheme, UsbDrive, VerifyMode, WindowsEdition, WindowsUnattendConfig,
 };
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 use std::fs;
@@ -526,7 +526,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.0 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.1 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -1061,7 +1061,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.0",
+                                "v0.6.1",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -1375,20 +1375,28 @@ impl eframe::App for BootLiteApp {
                                 });
                             });
 
-                            // Row 4 (Windows 10/11 ISO Only): Dedicated AutoPilot & Unattended Setup Bar
+                            // Row 4 (Windows 10/11 ISO Only): Direct-to-Format Pre-Flash Controls & AutoPilot Bar
                             if is_win_iso {
                                 ui.add_space(4.0);
                                 egui::Frame::default()
                                     .fill(Color32::from_rgb(15, 23, 42))
                                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(37, 99, 235)))
                                     .rounding(7.0)
-                                    .inner_margin(egui::Margin::symmetric(9.0, 5.0))
+                                    .inner_margin(egui::Margin::symmetric(9.0, 6.0))
                                     .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.add_enabled_ui(!is_running, |ui| {
                                                 ui.checkbox(
+                                                    &mut self.unattend_config.enabled,
+                                                    RichText::new("Jump Straight to Disk Format")
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(TEXT_MAIN),
+                                                );
+                                                ui.add_space(4.0);
+                                                ui.checkbox(
                                                     &mut self.unattend_config.extract_autopilot_hash,
-                                                    RichText::new("Extract Laptop AutoPilot Hash to USB (\\AutoPilot\\)")
+                                                    RichText::new("Save AutoPilot CSV (\\AutoPilot\\)")
                                                         .size(11.5)
                                                         .strong()
                                                         .color(TEXT_MAIN),
@@ -1403,7 +1411,7 @@ impl eframe::App for BootLiteApp {
                                                             .unattend_config
                                                             .active_tweak_count();
                                                         let btn_lbl = format!(
-                                                            "Windows Setup & AutoPilot Studio ({})",
+                                                            "More Setup Options ({})",
                                                             active_cnt
                                                         );
                                                         let ubtn = egui::Button::new(
@@ -1428,6 +1436,48 @@ impl eframe::App for BootLiteApp {
                                                 },
                                             );
                                         });
+
+                                        if self.unattend_config.enabled {
+                                            ui.add_space(3.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.add_enabled_ui(!is_running, |ui| {
+                                                    ui.label(
+                                                        RichText::new("Edition to Install:")
+                                                            .size(11.0)
+                                                            .color(TEXT_SUB),
+                                                    );
+                                                    for ed in [
+                                                        WindowsEdition::Pro,
+                                                        WindowsEdition::Home,
+                                                        WindowsEdition::HomeSingleLanguage,
+                                                        WindowsEdition::Enterprise,
+                                                        WindowsEdition::PromptUser,
+                                                    ] {
+                                                        let active =
+                                                            self.unattend_config.edition == ed;
+                                                        let b = egui::Button::new(
+                                                            RichText::new(ed.short_label())
+                                                                .size(10.5)
+                                                                .strong()
+                                                                .color(if active {
+                                                                    Color32::WHITE
+                                                                } else {
+                                                                    TEXT_SUB
+                                                                }),
+                                                        )
+                                                        .fill(if active {
+                                                            ACCENT_PRIMARY
+                                                        } else {
+                                                            Color32::from_rgb(30, 41, 59)
+                                                        })
+                                                        .rounding(5.0);
+                                                        if ui.add(b).clicked() {
+                                                            self.unattend_config.edition = ed;
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                        }
                                     });
                             }
                         }
@@ -2235,14 +2285,30 @@ impl eframe::App for BootLiteApp {
                                         .desired_width(180.0),
                                     );
                                 });
-                                ui.horizontal(|ui| {
-                                    ui.label("Windows Setup Language / Locale:");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("ISO Language:");
                                     ui.add(
                                         egui::TextEdit::singleline(
                                             &mut self.unattend_config.ui_language,
                                         )
                                         .hint_text("en-US")
-                                        .desired_width(100.0),
+                                        .desired_width(75.0),
+                                    );
+                                    ui.label("Time/Currency:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.unattend_config.time_currency_locale,
+                                        )
+                                        .hint_text("en-IN")
+                                        .desired_width(75.0),
+                                    );
+                                    ui.label("Keyboard:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut self.unattend_config.keyboard_locale,
+                                        )
+                                        .hint_text("en-US")
+                                        .desired_width(75.0),
                                     );
                                 });
                                 ui.add_space(4.0);

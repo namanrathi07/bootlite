@@ -2,7 +2,7 @@ pub mod platform;
 pub mod unattend;
 pub mod windows_iso;
 
-pub use unattend::WindowsUnattendConfig;
+pub use unattend::{WindowsEdition, WindowsUnattendConfig};
 
 use anyhow::{Context, Result};
 use bzip2_rs::DecoderReader as Bz2Decoder;

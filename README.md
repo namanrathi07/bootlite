@@ -1,10 +1,10 @@
-# ⚡ BootLite (`v0.6.0`)
+# ⚡ BootLite (`v0.6.1`)
 
 **Cross-Platform Raw Hardware USB Flasher, Windows 10/11 Unattended & AutoPilot Studio, and SHA-256 Verifier**
 
 *Built in 100% Native Rust (`bootlite-core`, `bootlite-gui`, `bootlite-cli`) for macOS, Windows, and Linux.*
 
-[![Release](https://img.shields.io/badge/release-v0.6.0-3b82f6?style=flat-square)](https://github.com/NR3009/bootlite/releases/latest)
+[![Release](https://img.shields.io/badge/release-v0.6.1-3b82f6?style=flat-square)](https://github.com/NR3009/bootlite/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=flat-square)](#download-pre-built-binaries)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
@@ -16,7 +16,7 @@ Most USB utilities force a compromise: **Rufus** is fast and supports Windows IS
 
 **BootLite (`~4 MB` single binary)** combines native cross-platform raw flashing, clean UEFI Windows 10/11 media creation, unattended `autounattend.xml` customization, and automated **Windows AutoPilot Hardware Hash extraction** in a single native Rust studio:
 
-| Capability | ⚡ BootLite `v0.6.0` | Rufus `v4.x` | balenaEtcher `v2.x` | Ventoy `v1.x` |
+| Capability | ⚡ BootLite `v0.6.1` | Rufus `v4.x` | balenaEtcher `v2.x` | Ventoy `v1.x` |
 | :--- | :---: | :---: | :---: | :---: |
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes | ⚠️ Windows / Linux |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot | ✅ Multi-ISO Shim |
@@ -36,7 +36,7 @@ Most USB utilities force a compromise: **Rufus** is fast and supports Windows IS
 
 ## 📦 Download Pre-Built Binaries
 
-Download the latest release directly from [**GitHub Releases (`v0.6.0`)**](https://github.com/NR3009/bootlite/releases/latest):
+Download the latest release directly from [**GitHub Releases (`v0.6.1`)**](https://github.com/NR3009/bootlite/releases/latest):
 
 * 🍎 **macOS (Apple Silicon):** [`BootLite-macOS-AppleSilicon.dmg`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-macOS-AppleSilicon.dmg)
 * 💻 **Windows 10 / 11 (x64 Portable — Zero DLL Dependencies):** [`BootLite-Windows-x86_64-Portable.exe`](https://github.com/NR3009/bootlite/releases/latest/download/BootLite-Windows-x86_64-Portable.exe)
