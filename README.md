@@ -4,7 +4,7 @@
 
 <br/>
 
-[![Latest Release](https://img.shields.io/badge/release-v0.6.3-2563eb?style=for-the-badge&logo=github)](https://github.com/namanrathi07/bootlite/releases)
+[![Latest Release](https://img.shields.io/badge/release-v0.6.4-2563eb?style=for-the-badge&logo=github)](https://github.com/namanrathi07/bootlite/releases)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-10b981?style=for-the-badge)](#downloads)
 [![Rust](https://img.shields.io/badge/built%20with-100%25%20Native%20Rust-f97316?style=for-the-badge&logo=rust)](https://github.com/namanrathi07/bootlite)
 [![License: MIT](https://img.shields.io/badge/license-MIT-6366f1?style=for-the-badge)](https://github.com/namanrathi07/bootlite/blob/main/LICENSE)
@@ -22,7 +22,7 @@
 ---
 
 <a id="downloads"></a>
-## ⬇️ One-Click Downloads (`v0.6.3`)
+## ⬇️ One-Click Downloads (`v0.6.4`)
 
 All release binaries are built automatically via GitHub Actions CI. You can also browse all versions on the [**GitHub Releases Page**](https://github.com/namanrathi07/bootlite/releases).
 
@@ -48,7 +48,7 @@ Traditional USB utilities force a compromise: **Rufus** is fast and supports Win
 
 **BootLite (`~4 MB` single binary)** unifies native cross-platform raw flashing, standard UEFI Windows 10/11 media creation, zero-prompt disk format boot, and **Microsoft Intune AutoPilot hardware hash extraction** into a single native Rust application:
 
-| Capability | ⚡ BootLite `v0.6.3` | Rufus `v4.x` | balenaEtcher `v2.x` | Ventoy `v1.x` |
+| Capability | ⚡ BootLite `v0.6.4` | Rufus `v4.x` | balenaEtcher `v2.x` | Ventoy `v1.x` |
 | :--- | :---: | :---: | :---: | :---: |
 | **Native macOS, Windows & Linux GUI + CLI** | ✅ All 3 OSes | ❌ Windows Only | ✅ All 3 OSes | ⚠️ Windows / Linux |
 | **Windows 10 / 11 UDF ISO Bootable USB Builder** | ✅ Auto (FAT32 UEFI + NTFS/ExFAT) | ✅ Yes | ❌ Fails to boot | ✅ Multi-ISO Shim |

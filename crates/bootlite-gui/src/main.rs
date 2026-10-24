@@ -277,6 +277,21 @@ fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: impl Into<String>) {
     }
 }
 
+fn open_external_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+    }
+}
+
 fn os_io_mode_description() -> &'static str {
     if cfg!(target_os = "macos") {
         "macOS Raw Character Device (/dev/rdiskN) + F_NOCACHE / F_FULLFSYNC"
@@ -507,6 +522,7 @@ struct BootLiteApp {
     partition_scheme: PartitionScheme,
     verify_mode: VerifyMode,
     unattend_config: WindowsUnattendConfig,
+    show_about_modal: bool,
     show_unattend_modal: bool,
     unattend_tab: UnattendTab,
     show_confirm_modal: bool,
@@ -526,7 +542,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.3 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.4 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -549,6 +565,7 @@ impl BootLiteApp {
             partition_scheme: PartitionScheme::Auto,
             verify_mode: VerifyMode::Fast,
             unattend_config: WindowsUnattendConfig::default(),
+            show_about_modal: false,
             show_unattend_modal: false,
             unattend_tab: UnattendTab::Basic,
             show_confirm_modal: false,
@@ -1061,7 +1078,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.3",
+                                "v0.6.4",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -1076,6 +1093,21 @@ impl eframe::App for BootLiteApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let about_btn = egui::Button::new(
+                            RichText::new("About")
+                                .size(11.5)
+                                .strong()
+                                .color(TEXT_MAIN),
+                        )
+                        .fill(Color32::from_rgb(30, 41, 59))
+                        .stroke(Stroke::new(1.0_f32, BORDER_DIM))
+                        .rounding(6.0);
+
+                        if ui.add(about_btn).clicked() {
+                            self.show_about_modal = true;
+                        }
+                        ui.add_space(6.0);
+
                         if self.has_root {
                             draw_pill(
                                 ui,
@@ -2540,6 +2572,69 @@ impl eframe::App for BootLiteApp {
                         if ui.button("Cancel").clicked() {
                             self.show_reset_modal = false;
                         }
+                    });
+                });
+        }
+
+
+        // ABOUT BOOTLITE STUDIO MODAL
+        if self.show_about_modal {
+            egui::Window::new("About BootLite")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.set_max_width(520.0);
+
+                    ui.horizontal(|ui| {
+                        draw_brand_logo(ui);
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("BootLite Studio").size(16.0).strong().color(TEXT_MAIN));
+                                draw_pill(ui, "v0.6.4", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
+                            });
+                            ui.label(RichText::new("High-Performance Native Rust USB Flasher & Windows Deployment Studio").size(11.0).color(TEXT_SUB));
+                        });
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.label(RichText::new("👤 CREATOR & CREDITS").size(11.5).strong().color(ACCENT_GLOW));
+                    ui.label(RichText::new("• Created & Engineered by: Naman Rathi (@namanrathi07)\n• License: MIT License (100% Free & Open-Source)\n• Repository: https://github.com/namanrathi07/bootlite").size(11.0).color(TEXT_MAIN));
+
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("🛠️ ARCHITECTURE & TECH STACK").size(11.5).strong().color(ACCENT_GLOW));
+                    ui.label(RichText::new("Built from scratch in 100% Native Rust (~4 MB binary) with zero C runtime dependencies:\n• bootlite-core: Raw sector I/O engine, decompression pipelines (.xz, .zst, .bz2, .gz),\n  Windows 10/11 UDF UEFI builder, autounattend.xml engine & AutoPilot extractor.\n• bootlite-gui: GPU-accelerated native desktop studio powered by egui.\n• bootlite-cli: Headless command-line interface for server automation.").size(10.5).color(TEXT_SUB));
+
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("🛡️ SAFETY & VERIFICATION").size(11.5).strong().color(ACCENT_SUCCESS));
+                    ui.label(RichText::new("• 3-OS Kernel Lockout: Physically blocks internal system boot drives across platforms.\n• Deferred Sector-0 Commit: Writes MBR/GPT boot records only after verifying payload integrity.\n• Fast Verify (~3s): Spot-checks boot records and cryptographic sample blocks across NAND flash.").size(10.5).color(TEXT_SUB));
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if small_slate_button(ui, "🌐 Open GitHub Repo").clicked() {
+                            open_external_url("https://github.com/namanrathi07/bootlite");
+                        }
+                        if small_slate_button(ui, "🐛 Report an Issue").clicked() {
+                            open_external_url("https://github.com/namanrathi07/bootlite/issues/new/choose");
+                        }
+                        if small_slate_button(ui, "📋 Copy Info").clicked() {
+                            ctx.copy_text("BootLite v0.6.4 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close_btn = egui::Button::new(RichText::new("Close").strong().color(Color32::WHITE))
+                                .fill(ACCENT_PRIMARY)
+                                .rounding(6.0);
+                            if ui.add(close_btn).clicked() {
+                                self.show_about_modal = false;
+                            }
+                        });
                     });
                 });
         }

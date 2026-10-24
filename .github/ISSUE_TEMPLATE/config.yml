@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: "📦 Download Latest BootLite Releases"
+    url: "[https://github.com/namanrathi07/bootlite/releases/latest](https://github.com/namanrathi07/bootlite/releases/latest)"
+    about: "Download pre-built binaries for macOS, Windows, and Linux"
+  - name: "📖 Documentation & Contribution Rules"
+    url: "[https://github.com/namanrathi07/bootlite/blob/main/CONTRIBUTING.md](https://github.com/namanrathi07/bootlite/blob/main/CONTRIBUTING.md)"
+    about: "Read the architecture guide and PR rules before contributing"
