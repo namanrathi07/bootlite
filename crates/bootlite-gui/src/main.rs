@@ -526,7 +526,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.1 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.3 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -1061,7 +1061,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.1",
+                                "v0.6.3",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );

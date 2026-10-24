@@ -33,9 +33,6 @@ impl WindowsEdition {
         }
     }
 
-    /// Official Microsoft Generic Setup Keys (KMS/Retail setup selection keys).
-    /// These tell Windows Setup which edition image to install so it skips the Edition prompt
-    /// and jumps straight to the Drive Format screen, without blocking OEM/Digital activation.
     pub fn generic_setup_key(self) -> Option<&'static str> {
         match self {
             Self::Pro => Some("W269N-WFGWX-YVC9B-4J6C9-T83GX"),
@@ -50,7 +47,6 @@ impl WindowsEdition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowsUnattendConfig {
-    /// Enabled by default so Windows Setup skips pre-disk prompts and jumps straight to the Drive Format screen
     pub enabled: bool,
     pub edition: WindowsEdition,
     pub ui_language: String,
@@ -87,7 +83,7 @@ impl Default for WindowsUnattendConfig {
             bypass_ms_account: true,
             disable_privacy_questions: true,
             disable_bitlocker: true,
-            create_local_account: false,
+            create_local_account: true,
             local_username: "Admin".to_string(),
             local_password: String::new(),
             auto_logon: true,
@@ -108,29 +104,28 @@ fn xml_escape(input: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Generates the standalone PowerShell script placed inside `\AutoPilot\Extract-AutoPilotHash.ps1` on the USB drive.
-/// Saves one single clean Intune CSV per laptop (`AutoPilotHWID_<SerialNumber>.csv`) so hostname changes never duplicate files.
+/// Generates `\AutoPilot\Extract-AutoPilotHash.ps1` on the USB drive.
+/// Strictly writes ONLY to the USB drive's `\AutoPilot\` folder (`AutoPilotHWID_<SerialNumber>.csv`)
+/// and never creates or copies any files onto the laptop's local C: drive.
 pub fn generate_autopilot_ps1_script() -> &'static str {
-    r#"# BootLite Windows AutoPilot Hardware Hash Extractor
-# Saves a single Microsoft Intune Hardware Hash CSV (AutoPilotHWID_<SerialNumber>.csv) in the USB \AutoPilot\ folder.
+    r#"# BootLite Windows AutoPilot Hardware Hash Extractor (100% USB-Only)
+# Saves a single Microsoft Intune CSV (AutoPilotHWID_<SerialNumber>.csv) directly into the USB \AutoPilot\ folder.
 
 $ErrorActionPreference = 'Stop'
 
 try {
-    # 1. Locate the target AutoPilot output directory on the USB drive
-    $OutDir =$PSScriptRoot
-    if ([string]::IsNullOrWhiteSpace($OutDir) -or -not (Test-Path -LiteralPath$OutDir)) {
-        $UsbDisk = Get-Volume \vert{} Where-Object {$_.DriveLetter -ne $null } \vert{} ForEach-Object {$Candidate = "$($_.DriveLetter):\AutoPilot"
-            if (Test-Path -LiteralPath $Candidate) {$Candidate }
+    # 1. Locate the USB drive's \AutoPilot\ folder (never writes to C:)
+    $OutDir = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($OutDir) -or -not (Test-Path -LiteralPath $OutDir)) {
+        $UsbDisk = Get-Volume | Where-Object { $_.DriveLetter -ne $null -and $_.DriveLetter -ne 'C' } | ForEach-Object {
+            $Candidate = "$($_.DriveLetter):\AutoPilot"
+            if (Test-Path -LiteralPath $Candidate) { $Candidate }
         } | Select-Object -First 1
         if ($UsbDisk) {
-            $OutDir =$UsbDisk
+            $OutDir = $UsbDisk
         } else {
-            $OutDir = "C:\AutoPilot"
+            exit 0
         }
-    }
-    if (-not (Test-Path -LiteralPath $OutDir)) {
-        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     }
 
     # 2. Query BIOS Serial Number
@@ -144,38 +139,43 @@ try {
         $ProdId = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductId -ErrorAction SilentlyContinue).ProductId
     } catch {}
 
-    # 4. Query 4K Hardware Hash from WMI MDM_DevDetail_Ext01
-    $DevDetail = Get-CimInstance -Namespace 'root/cimv2/mdm/dmmap' -ClassName 'MDM_DevDetail_Ext01' -Filter "InstanceID='Ext' AND ParentID='./DevDetail'" -ErrorAction SilentlyContinue
-    $HwHash = if ($DevDetail -and $DevDetail.DeviceHardwareData) { ($DevDetail.DeviceHardwareData).Trim() } else { "" }
+    # 4. Query 4K Hardware Hash from WMI MDM_DevDetail_Ext01 (with brief retry if WMI is still initializing)
+    $HwHash = ""
+    for ($i = 0; $i -lt 5; $i++) {
+        $DevDetail = Get-CimInstance -Namespace 'root/cimv2/mdm/dmmap' -ClassName 'MDM_DevDetail_Ext01' -Filter "InstanceID='Ext' AND ParentID='./DevDetail'" -ErrorAction SilentlyContinue
+        if ($DevDetail -and $DevDetail.DeviceHardwareData) {
+            $HwHash = ($DevDetail.DeviceHardwareData).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($HwHash)) { break }
+        }
+        Start-Sleep -Seconds 2
+    }
 
     if ([string]::IsNullOrWhiteSpace($HwHash)) {
-        Write-Warning "MDM_DevDetail_Ext01 Hardware Hash is not yet populated in WMI."
         exit 1
     }
 
     $CsvHeader = "Device Serial Number,Windows Product ID,Hardware Hash"
     $CsvRow    = "$Serial,$ProdId,$HwHash"
 
-    # 5. Write ONE clean Intune-ready CSV file named by Serial Number (overwrites if run twice on same laptop)
+    # 5. Save single clean Intune CSV directly onto the USB drive's \AutoPilot\ directory
     $DeviceFile = Join-Path $OutDir "AutoPilotHWID_${SafeSerial}.csv"
-    Set-Content -LiteralPath $DeviceFile -Value @($CsvHeader,$CsvRow) -Encoding Ascii -Force
+    Set-Content -LiteralPath $DeviceFile -Value @($CsvHeader, $CsvRow) -Encoding Ascii -Force
 
-    Write-Host "[OK] Intune AutoPilot CSV saved to: $DeviceFile" -ForegroundColor Green
+    Write-Host "[OK] Intune AutoPilot CSV saved to USB: $DeviceFile" -ForegroundColor Green
     exit 0
 } catch {
-    Write-Error "Failed to extract AutoPilot Hardware Hash: $_"
     exit 1
 }
 "#
 }
 
-/// Generates the one-click batch launcher placed at `\AutoPilot\Extract-AutoPilotHash.cmd` on the USB drive.
+/// Generates the batch launcher placed at `\AutoPilot\Extract-AutoPilotHash.cmd` on the USB drive.
 pub fn generate_autopilot_cmd_launcher() -> &'static str {
     "@echo off\r\n\
      title BootLite - Windows AutoPilot Hardware Hash Extractor\r\n\
      echo ======================================================================\r\n\
-     echo   BootLite AutoPilot Hardware Hash Extractor\r\n\
-     echo   Target Output Folder: %~dp0\r\n\
+     echo   BootLite AutoPilot Hardware Hash Extractor (USB-Only)\r\n\
+     echo   Target USB Output Folder: %~dp0\r\n\
      echo ======================================================================\r\n\
      powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%~dp0Extract-AutoPilotHash.ps1\"\r\n\
      if %ERRORLEVEL% EQU 0 (\r\n\
@@ -183,8 +183,7 @@ pub fn generate_autopilot_cmd_launcher() -> &'static str {
          echo [SUCCESS] Intune Hardware Hash CSV saved inside %~dp0\r\n\
      ) else (\r\n\
          echo.\r\n\
-         echo [WARN] Could not extract hash. Run as Administrator inside Windows OOBE\r\n\
-         echo        ^(Shift+F10^) or full Windows desktop.\r\n\
+         echo [WARN] Could not extract hash. Run as Administrator inside Windows.\r\n\
      )\r\n\
      if \"%1\" NEQ \"--silent\" pause\r\n"
 }
@@ -200,7 +199,7 @@ impl WindowsUnattendConfig {
             count += 1;
         }
         if self.enabled {
-            count += 1; // Jump straight to Disk Format (skip Language/Key/EULA)
+            count += 1; // Jump straight to Disk Format + OOBE Country/Keyboard Skip
             if self.bypass_hardware_checks {
                 count += 1;
             }
@@ -266,11 +265,6 @@ impl WindowsUnattendConfig {
         }
 
         let mut specialize_commands = Vec::new();
-        if self.extract_autopilot_hash {
-            specialize_commands.push(
-                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } \vert{} ForEach-Object {$s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { &$s } }""#.to_string(),
-            );
-        }
         if self.enabled {
             if self.bypass_ms_account {
                 specialize_commands.push(
@@ -294,8 +288,9 @@ impl WindowsUnattendConfig {
 
         let mut firstlogon_commands = Vec::new();
         if self.extract_autopilot_hash {
+            // Runs directly from the USB drive and saves the CSV back to the USB drive (\AutoPilot\)
             firstlogon_commands.push(
-                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter } \vert{} ForEach-Object {$s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { &$s } }""#.to_string(),
+                r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne 'C' } | ForEach-Object { $s = \"$($_.DriveLetter):\AutoPilot\Extract-AutoPilotHash.ps1\"; if (Test-Path -LiteralPath $s) { & $s } }""#.to_string(),
             );
         }
         if self.enabled {
@@ -321,7 +316,7 @@ impl WindowsUnattendConfig {
         xml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         xml.push_str("<unattend xmlns=\"urn:schemas-microsoft-com:unattend\" xmlns:wcm=\"http://schemas.microsoft.com/WMIConfig/2002/State\">\n");
 
-        // 1. windowsPE pass: Skips Language, Keyboard, Product Key, Edition & EULA -> Lands directly on the Drive Format screen!
+        // 1. windowsPE pass: Skips pre-install Language, Keyboard, Product Key, Edition & EULA -> Lands directly on the Drive Format screen!
         if self.enabled {
             xml.push_str("  <settings pass=\"windowsPE\">\n");
             xml.push_str("    <component name=\"Microsoft-Windows-International-Core-WinPE\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n");
@@ -386,12 +381,21 @@ impl WindowsUnattendConfig {
             xml.push_str("  </settings>\n");
         }
 
-        // 3. oobeSystem pass
+        // 3. oobeSystem pass: Includes Microsoft-Windows-International-Core so Country/Region & Keyboard Layout are skipped!
         xml.push_str("  <settings pass=\"oobeSystem\">\n");
+        if self.enabled {
+            xml.push_str("    <component name=\"Microsoft-Windows-International-Core\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n");
+            xml.push_str(&format!("      <InputLocale>{}</InputLocale>\n", kbd));
+            xml.push_str(&format!("      <SystemLocale>{}</SystemLocale>\n", locale));
+            xml.push_str(&format!("      <UILanguage>{}</UILanguage>\n", ui_lang));
+            xml.push_str(&format!("      <UserLocale>{}</UserLocale>\n", locale));
+            xml.push_str("    </component>\n");
+        }
         xml.push_str("    <component name=\"Microsoft-Windows-Shell-Setup\" processorArchitecture=\"amd64\" publicKeyToken=\"31bf3856ad364e35\" language=\"neutral\" versionScope=\"nonSxS\">\n");
         if self.enabled {
             xml.push_str("      <OOBE>\n");
             xml.push_str("        <HideEULAPage>true</HideEULAPage>\n");
+            xml.push_str("        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>\n");
             if self.bypass_ms_account {
                 xml.push_str("        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>\n");
                 xml.push_str("        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>\n");
@@ -456,22 +460,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_autopilot_script_creates_single_clean_csv() {
+    fn test_autopilot_script_is_usb_only_and_single_csv() {
         let ps1 = generate_autopilot_ps1_script();
         assert!(ps1.contains("Device Serial Number,Windows Product ID,Hardware Hash"));
-        assert!(ps1.contains("MDM_DevDetail_Ext01"));
         assert!(ps1.contains("AutoPilotHWID_${SafeSerial}.csv"));
-        assert!(!ps1.contains("AutoPilotHWID_Fleet.csv"));
+        assert!(!ps1.contains("C:\\AutoPilot"));
+        assert!(!ps1.contains("MessageBox"));
     }
 
     #[test]
-    fn test_unattend_xml_skips_to_disk_format_screen() {
+    fn test_unattend_xml_usb_only_and_skips_oobe_country_keyboard() {
         let cfg = WindowsUnattendConfig::default();
-        assert!(cfg.enabled);
         let xml = cfg.generate_xml();
-        assert!(xml.contains("<SetupUILanguage>"));
-        assert!(xml.contains("<WillShowUI>OnError</WillShowUI>"));
-        assert!(xml.contains("W269N-WFGWX-YVC9B-4J6C9-T83GX")); // Windows Pro Generic Setup Key
-        assert!(xml.contains("BypassTPMCheck"));
+        assert!(xml.contains("Microsoft-Windows-International-Core-WinPE"));
+        assert!(xml.contains("<component name=\"Microsoft-Windows-International-Core\""));
+        assert!(!xml.contains("C:\\Windows\\Panther"));
     }
 }

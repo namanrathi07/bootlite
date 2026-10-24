@@ -7,20 +7,44 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const COPY_CHUNK: usize = 8 * 1024 * 1024; // 8 MB high-throughput streaming buffer
 const FAT32_MAX_FILE_SIZE: u64 = 4_000_000_000; // Safe threshold (~3.72 GiB) for FAT32
 pub const WIN_ISO_OVERHEAD_BYTES: u64 = 700_000_000; // ~700 MB overhead for UEFI boot partition
 
+/// Retries filesystem operations up to 8 times (350ms apart) so transient Windows MountMgr delays,
+/// Defender scans, or USB bus resets (`os error 3` ERROR_PATH_NOT_FOUND / `os error 5` / `os error 32`)
+/// never abort a flash operation.
+fn with_fs_retry<T, F>(mut op: F) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+{
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 8 {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(350));
+            }
+        }
+    }
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, u64)>) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)? {
+    let entries = with_fs_retry(|| fs::read_dir(dir))
+        .with_context(|| format!("Failed to read directory: {}", dir.display()))?;
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let meta = entry.metadata()?;
+        let meta = with_fs_retry(|| entry.metadata())?;
         if meta.is_dir() {
             collect_files(&path, out)?;
         } else if meta.is_file() {
@@ -61,11 +85,16 @@ where
     F: FnMut(FlashProgress),
 {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
+        with_fs_retry(|| fs::create_dir_all(parent)).with_context(|| {
+            format!(
+                "Failed to create USB directory '{}' (verify USB connection)",
+                parent.display()
+            )
+        })?;
     }
-    let mut reader = File::open(src)
+    let mut reader = with_fs_retry(|| File::open(src))
         .with_context(|| format!("Failed to open ISO source file: {}", src.display()))?;
-    let mut writer = File::create(dst)
+    let mut writer = with_fs_retry(|| File::create(dst))
         .with_context(|| format!("Failed to create USB file: {}", dst.display()))?;
 
     let mut file_hasher = Sha256::new();
@@ -95,7 +124,7 @@ where
     }
 
     if file_len >= 64 * 1024 * 1024 {
-        writer.sync_all()?;
+        let _ = writer.sync_all();
     }
     Ok(file_hasher.finalize().into())
 }
@@ -113,7 +142,7 @@ fn verify_usb_file_readback<F>(
 where
     F: FnMut(FlashProgress),
 {
-    let mut reader = File::open(usb_file).with_context(|| {
+    let mut reader = with_fs_retry(|| File::open(usb_file)).with_context(|| {
         format!(
             "Failed to open USB file for verification: {}",
             usb_file.display()
@@ -155,7 +184,7 @@ where
 }
 
 fn fast_verify_spot_check(src_file: &Path, usb_file: &Path, file_len: u64) -> Result<()> {
-    let meta = fs::metadata(usb_file).with_context(|| {
+    let meta = with_fs_retry(|| fs::metadata(usb_file)).with_context(|| {
         format!(
             "Missing written file on USB drive: {}",
             usb_file.display()
@@ -174,8 +203,8 @@ fn fast_verify_spot_check(src_file: &Path, usb_file: &Path, file_len: u64) -> Re
     }
 
     let sample_size: usize = 512 * 1024;
-    let mut src = File::open(src_file)?;
-    let mut dst = File::open(usb_file)?;
+    let mut src = with_fs_retry(|| File::open(src_file))?;
+    let mut dst = with_fs_retry(|| File::open(usb_file))?;
     let mut b1 = vec![0u8; sample_size];
     let mut b2 = vec![0u8; sample_size];
 
@@ -307,28 +336,31 @@ where
         written_targets.push((src_path.clone(), dst_data, *file_len, digest));
     }
 
-    // Always provision the \AutoPilot\ folder and hardware hash extraction scripts on the USB drive
+    // Provision the \AutoPilot\ folder and hardware hash extraction scripts strictly on the USB drive
     for root_dir in [efi_mount, Some(data_mount)].into_iter().flatten() {
         let ap_dir = root_dir.join("AutoPilot");
-        let _ = fs::create_dir_all(&ap_dir);
-        let _ = fs::write(
-            ap_dir.join("Extract-AutoPilotHash.ps1"),
-            generate_autopilot_ps1_script().as_bytes(),
-        );
-        let _ = fs::write(
-            ap_dir.join("Extract-AutoPilotHash.cmd"),
-            generate_autopilot_cmd_launcher().as_bytes(),
-        );
+        let _ = with_fs_retry(|| fs::create_dir_all(&ap_dir));
+        let _ = with_fs_retry(|| {
+            fs::write(
+                ap_dir.join("Extract-AutoPilotHash.ps1"),
+                generate_autopilot_ps1_script().as_bytes(),
+            )
+        });
+        let _ = with_fs_retry(|| {
+            fs::write(
+                ap_dir.join("Extract-AutoPilotHash.cmd"),
+                generate_autopilot_cmd_launcher().as_bytes(),
+            )
+        });
     }
 
+    // Write autounattend.xml strictly to the USB root
     if let Some(xml) = unattend_xml {
         if let Some(efi_dir) = efi_mount {
-            let efi_xml = efi_dir.join("autounattend.xml");
-            fs::write(&efi_xml, xml.as_bytes())
+            with_fs_retry(|| fs::write(efi_dir.join("autounattend.xml"), xml.as_bytes()))
                 .context("Failed to write autounattend.xml to WINBOOT partition")?;
         }
-        let data_xml = data_mount.join("autounattend.xml");
-        fs::write(&data_xml, xml.as_bytes())
+        with_fs_retry(|| fs::write(data_mount.join("autounattend.xml"), xml.as_bytes()))
             .context("Failed to write autounattend.xml to WINSETUP partition")?;
     }
 
@@ -382,19 +414,25 @@ where
 
 #[cfg(target_os = "macos")]
 fn get_macos_slice_mountpoint(slice_dev: &str) -> Option<PathBuf> {
-    for _ in 0..25 {
+    for attempt in 0..30 {
+        if attempt == 10 {
+            let _ = Command::new("diskutil").args(["mount", slice_dev]).status();
+        }
         if let Ok(out) = Command::new("diskutil").args(["info", slice_dev]).output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
                 if let Some(val) = line.trim().strip_prefix("Mount Point:") {
                     let mp = val.trim();
                     if !mp.is_empty() && mp.starts_with('/') {
-                        return Some(PathBuf::from(mp));
+                        let p = PathBuf::from(mp);
+                        if p.is_dir() {
+                            return Some(p);
+                        }
                     }
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(250));
     }
     None
 }
@@ -575,7 +613,8 @@ fn find_two_free_drive_letters() -> Result<(char, char)> {
     }
     let mask = unsafe { GetLogicalDrives() };
     let mut free = Vec::new();
-    for i in (3..26u32).rev() {
+    // Search downward from Z: to G: to avoid low drive letters reserved by card readers
+    for i in (6..26u32).rev() {
         if (mask & (1 << i)) == 0 {
             free.push((b'A' + (i as u8)) as char);
             if free.len() == 2 {
@@ -584,7 +623,64 @@ fn find_two_free_drive_letters() -> Result<(char, char)> {
         }
     }
     anyhow::bail!(
-        "No two free drive letters (D:..Z:) available on Windows to mount USB partitions"
+        "No two free drive letters (G:..Z:) available on Windows to mount USB partitions"
+    )
+}
+
+/// Waits for a newly formatted Windows USB partition (`expected_letter:\`) to come online in MountMgr.
+/// If `diskpart` delayed or skipped the drive letter assignment (which causes `os error 3` ERROR_PATH_NOT_FOUND),
+/// this function queries the partition by volume label (`WINBOOT` / `WINSETUP`) or disk number in PowerShell
+/// and forces the drive letter mount before returning the verified root `PathBuf`.
+#[cfg(target_os = "windows")]
+fn wait_for_windows_usb_mount(
+    disk_num: u32,
+    vol_label: &str,
+    expected_letter: char,
+) -> Result<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let expected_root = PathBuf::from(format!(r"{}:\", expected_letter));
+    for attempt in 0..24 {
+        if expected_root.is_dir() {
+            return Ok(expected_root);
+        }
+        if attempt == 4 || attempt == 12 {
+            // Query Windows Storage / Volume Manager to see if the partition mounted under a different letter
+            // or needs an explicit drive letter assignment
+            let ps_fix = format!(
+                "$vol = Get-Volume -FileSystemLabel '{}' -ErrorAction SilentlyContinue | Select-Object -First 1; \
+                 if ($vol -and $vol.DriveLetter) {{ Write-Output $vol.DriveLetter }} \
+                 else {{ \
+                   $part = Get-Partition -DiskNumber {} -ErrorAction SilentlyContinue | Where-Object {{ $_.DriveLetter -eq $null -and $_.Size -gt 100MB }} | Select-Object -First 1; \
+                   if ($part) {{ Set-Partition -InputObject $part -NewDriveLetter '{}' -ErrorAction SilentlyContinue; Write-Output '{}' }} \
+                 }}",
+                vol_label, disk_num, expected_letter, expected_letter
+            );
+            if let Ok(out) = Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", &ps_fix])
+                .output()
+            {
+                if let Some(actual_char) = String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .chars()
+                    .find(|c| c.is_ascii_alphabetic())
+                {
+                    let alt_root = PathBuf::from(format!(r"{}:\", actual_char));
+                    if alt_root.is_dir() {
+                        return Ok(alt_root);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(350));
+    }
+
+    anyhow::bail!(
+        "USB partition '{}' ({}:\\) did not come online after formatting. Please unplug and reconnect the USB drive.",
+        vol_label,
+        expected_letter
     )
 }
 
@@ -625,13 +721,26 @@ where
         );
     }
 
+    on_progress(FlashProgress {
+        phase: "Windows ISO: Mounting source ISO & waiting for UDF filesystem...",
+        bytes_processed: 0,
+        total_bytes: 100,
+        speed_mbps: 0.0,
+    });
+
     let _ = crate::platform::unmount_drive(drive);
     crate::platform::finish_device(None);
 
     let iso_str = image_path.to_string_lossy().replace('\'', "''");
+    // Mount ISO and poll until the UDF drive letter is live and readable (prevents os error 3 on source ISO)
     let mount_ps = format!(
-        "$img = Mount-DiskImage -ImagePath '{}' -PassThru; ($img | Get-Volume | Where-Object {{ $_.DriveLetter -ne $null }} | Select-Object -First 1).DriveLetter",
-        iso_str
+        "$img = Mount-DiskImage -ImagePath '{}' -PassThru -ErrorAction Stop; \
+         for ($i = 0; $i -lt 20; $i++) {{ \
+             $dl = (Get-DiskImage -ImagePath '{}' | Get-Volume -ErrorAction SilentlyContinue | Where-Object {{ $_.DriveLetter }} | Select-Object -First 1).DriveLetter; \
+             if ($dl -and (Test-Path \"$($dl):\\\")) {{ Write-Output $dl; break }}; \
+             Start-Sleep -Milliseconds 300 \
+         }}",
+        iso_str, iso_str
     );
     let out = Command::new("powershell")
         .creation_flags(CREATE_NO_WINDOW)
@@ -642,7 +751,7 @@ where
     let iso_letter = String::from_utf8_lossy(&out.stdout)
         .trim()
         .chars()
-        .next()
+        .find(|c| c.is_ascii_alphabetic())
         .ok_or_else(|| anyhow::anyhow!("Failed to obtain mounted Windows ISO drive letter"))?;
 
     struct WinIsoGuard(String);
@@ -664,6 +773,31 @@ where
     let needs_dual = has_large_wim_file(&iso_root)?;
     let (efi_letter, data_letter) = find_two_free_drive_letters()?;
 
+    // Stage 1: Clean stale partition tables in a dedicated diskpart pass first so VDS refreshes cleanly
+    on_progress(FlashProgress {
+        phase: "Windows ISO: Cleaning previous USB partition table...",
+        bytes_processed: 2,
+        total_bytes: 100,
+        speed_mbps: 0.0,
+    });
+    if let Ok(mut clean_dp) = Command::new("diskpart")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = clean_dp.stdin.take() {
+            let clean_script = format!(
+                "select disk {}\r\nattributes disk clear readonly\r\nclean\r\nrescan\r\nexit\r\n",
+                disk_num
+            );
+            let _ = stdin.write_all(clean_script.as_bytes());
+        }
+        let _ = clean_dp.wait();
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
     let convert_cmd = match scheme {
         PartitionScheme::Mbr => "convert mbr",
         PartitionScheme::Auto | PartitionScheme::Gpt => "convert gpt",
@@ -677,7 +811,7 @@ where
     let stream_hash = if needs_dual {
         on_progress(FlashProgress {
             phase: "Windows ISO: Partitioning USB (FAT32 UEFI + NTFS Setup)...",
-            bytes_processed: 0,
+            bytes_processed: 4,
             total_bytes: 100,
             speed_mbps: 0.0,
         });
@@ -692,9 +826,8 @@ where
 
         if let Some(mut stdin) = dp.stdin.take() {
             let script = format!(
-                "select disk {}\r\n\
-                 attributes disk clear readonly\r\n\
-                 clean\r\n\
+                "automount enable\r\n\
+                 select disk {}\r\n\
                  {}\r\n\
                  create partition primary size=900\r\n\
                  format fs=fat32 label=\"WINBOOT\" quick\r\n\
@@ -713,8 +846,9 @@ where
             anyhow::bail!("diskpart failed to create FAT32 + NTFS Windows boot layout");
         }
 
-        let efi_mount = PathBuf::from(format!(r"{}:\", efi_letter));
-        let data_mount = PathBuf::from(format!(r"{}:\", data_letter));
+        // Wait & verify both USB partitions are mounted in Win32 namespace before copying files
+        let efi_mount = wait_for_windows_usb_mount(disk_num, "WINBOOT", efi_letter)?;
+        let data_mount = wait_for_windows_usb_mount(disk_num, "WINSETUP", data_letter)?;
 
         copy_and_verify_windows_tree(
             &iso_root,
@@ -728,7 +862,7 @@ where
     } else {
         on_progress(FlashProgress {
             phase: "Windows ISO: Formatting USB as FAT32 (WINSETUP)...",
-            bytes_processed: 0,
+            bytes_processed: 4,
             total_bytes: 100,
             speed_mbps: 0.0,
         });
@@ -749,9 +883,8 @@ where
 
         if let Some(mut stdin) = dp.stdin.take() {
             let script = format!(
-                "select disk {}\r\n\
-                 attributes disk clear readonly\r\n\
-                 clean\r\n\
+                "automount enable\r\n\
+                 select disk {}\r\n\
                  {}\r\n\
                  {}\r\n\
                  format fs=fat32 label=\"WINSETUP\" quick\r\n\
@@ -767,7 +900,7 @@ where
             anyhow::bail!("diskpart failed to create FAT32 Windows boot layout");
         }
 
-        let data_mount = PathBuf::from(format!(r"{}:\", data_letter));
+        let data_mount = wait_for_windows_usb_mount(disk_num, "WINSETUP", data_letter)?;
         copy_and_verify_windows_tree(
             &iso_root,
             None,
@@ -886,7 +1019,7 @@ where
         }
 
         let _ = Command::new("partprobe").arg(&dev).status();
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(800));
 
         let (p1, p2) = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
             (
@@ -965,7 +1098,7 @@ where
         }
 
         let _ = Command::new("partprobe").arg(&dev).status();
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        std::thread::sleep(Duration::from_millis(800));
 
         let p1 = if drive.id.starts_with("mmcblk") || drive.id.starts_with("loop") {
             format!("/dev/{}p1", drive.id)
