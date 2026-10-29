@@ -13,9 +13,96 @@ const COPY_CHUNK: usize = 8 * 1024 * 1024; // 8 MB high-throughput streaming buf
 const FAT32_MAX_FILE_SIZE: u64 = 4_000_000_000; // Safe threshold (~3.72 GiB) for FAT32
 pub const WIN_ISO_OVERHEAD_BYTES: u64 = 700_000_000; // ~700 MB overhead for UEFI boot partition
 
-/// Retries filesystem operations up to 8 times (350ms apart) so transient Windows MountMgr delays,
-/// Defender scans, or USB bus resets (`os error 3` ERROR_PATH_NOT_FOUND / `os error 5` / `os error 32`)
-/// never abort a flash operation.
+/// Encodes a PowerShell script as UTF-16LE Base64 for `powershell.exe -EncodedCommand`.
+/// This completely eliminates all Windows command-line quote, backslash, and path escaping bugs.
+pub fn encode_powershell_utf16le_base64(script: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for u in script.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Builds a deterministic `diskpart /s` script for creating a bootable Windows 10/11 USB.
+/// Note: After `clean`, `diskpart` leaves the disk in MBR state. Calling `convert mbr` after `clean`
+/// causes `diskpart` to fail with `Virtual Disk Service error: The specified disk is not convertible`.
+pub fn build_windows_diskpart_script(
+    disk_num: u32,
+    scheme: PartitionScheme,
+    needs_dual: bool,
+    drive_size_bytes: u64,
+    efi_letter: char,
+    data_letter: char,
+) -> String {
+    let use_gpt = matches!(scheme, PartitionScheme::Gpt);
+    let convert_line = if use_gpt { "convert gpt\r\n" } else { "" };
+    let active_line = if use_gpt { "" } else { "active\r\n" };
+
+    if needs_dual {
+        format!(
+            "automount enable\r\n\
+             select disk {}\r\n\
+             attributes disk clear readonly noerr\r\n\
+             online disk noerr\r\n\
+             clean\r\n\
+             {}\
+             create partition primary size=1024\r\n\
+             format fs=fat32 label=\"WINBOOT\" quick\r\n\
+             {}\
+             assign letter={} noerr\r\n\
+             create partition primary\r\n\
+             format fs=ntfs label=\"WINSETUP\" quick\r\n\
+             assign letter={} noerr\r\n\
+             rescan\r\n\
+             exit\r\n",
+            disk_num, convert_line, active_line, efi_letter, data_letter
+        )
+    } else {
+        let create_part_cmd = if drive_size_bytes > 32 * 1024 * 1024 * 1024 {
+            "create partition primary size=32000"
+        } else {
+            "create partition primary"
+        };
+        format!(
+            "automount enable\r\n\
+             select disk {}\r\n\
+             attributes disk clear readonly noerr\r\n\
+             online disk noerr\r\n\
+             clean\r\n\
+             {}\
+             {}\r\n\
+             format fs=fat32 label=\"WINSETUP\" quick\r\n\
+             {}\
+             assign letter={} noerr\r\n\
+             rescan\r\n\
+             exit\r\n",
+            disk_num, convert_line, create_part_cmd, active_line, data_letter
+        )
+    }
+}
+
 fn with_fs_retry<T, F>(mut op: F) -> std::io::Result<T>
 where
     F: FnMut() -> std::io::Result<T>,
@@ -26,7 +113,7 @@ where
             Ok(val) => return Ok(val),
             Err(e) => {
                 attempt += 1;
-                if attempt >= 8 {
+                if attempt >= 10 {
                     return Err(e);
                 }
                 std::thread::sleep(Duration::from_millis(350));
@@ -606,6 +693,36 @@ where
 }
 
 #[cfg(target_os = "windows")]
+fn run_powershell_encoded(script: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let encoded = encode_powershell_utf16le_base64(script);
+    let out = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .output()
+        .context("Failed to execute Windows PowerShell")?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        anyhow::bail!(
+            "PowerShell error: {}",
+            if !stderr.is_empty() { stderr } else { stdout }
+        );
+    }
+    Ok(stdout)
+}
+
+#[cfg(target_os = "windows")]
 fn find_two_free_drive_letters() -> Result<(char, char)> {
     #[link(name = "kernel32")]
     extern "system" {
@@ -613,7 +730,6 @@ fn find_two_free_drive_letters() -> Result<(char, char)> {
     }
     let mask = unsafe { GetLogicalDrives() };
     let mut free = Vec::new();
-    // Search downward from Z: to G: to avoid low drive letters reserved by card readers
     for i in (6..26u32).rev() {
         if (mask & (1 << i)) == 0 {
             free.push((b'A' + (i as u8)) as char);
@@ -627,60 +743,73 @@ fn find_two_free_drive_letters() -> Result<(char, char)> {
     )
 }
 
-/// Waits for a newly formatted Windows USB partition (`expected_letter:\`) to come online in MountMgr.
-/// If `diskpart` delayed or skipped the drive letter assignment (which causes `os error 3` ERROR_PATH_NOT_FOUND),
-/// this function queries the partition by volume label (`WINBOOT` / `WINSETUP`) or disk number in PowerShell
-/// and forces the drive letter mount before returning the verified root `PathBuf`.
 #[cfg(target_os = "windows")]
-fn wait_for_windows_usb_mount(
+fn resolve_and_wait_for_usb_partition(
     disk_num: u32,
     vol_label: &str,
-    expected_letter: char,
+    preferred_letter: char,
 ) -> Result<PathBuf> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let preferred_root = PathBuf::from(format!(r"{}:\", preferred_letter));
+    if preferred_root.is_dir() {
+        return Ok(preferred_root);
+    }
 
-    let expected_root = PathBuf::from(format!(r"{}:\", expected_letter));
-    for attempt in 0..24 {
-        if expected_root.is_dir() {
-            return Ok(expected_root);
-        }
-        if attempt == 4 || attempt == 12 {
-            // Query Windows Storage / Volume Manager to see if the partition mounted under a different letter
-            // or needs an explicit drive letter assignment
-            let ps_fix = format!(
-                "$vol = Get-Volume -FileSystemLabel '{}' -ErrorAction SilentlyContinue | Select-Object -First 1; \
-                 if ($vol -and $vol.DriveLetter) {{ Write-Output $vol.DriveLetter }} \
-                 else {{ \
-                   $part = Get-Partition -DiskNumber {} -ErrorAction SilentlyContinue | Where-Object {{ $_.DriveLetter -eq $null -and $_.Size -gt 100MB }} | Select-Object -First 1; \
-                   if ($part) {{ Set-Partition -InputObject $part -NewDriveLetter '{}' -ErrorAction SilentlyContinue; Write-Output '{}' }} \
-                 }}",
-                vol_label, disk_num, expected_letter, expected_letter
-            );
-            if let Ok(out) = Command::new("powershell")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["-NoProfile", "-Command", &ps_fix])
-                .output()
-            {
-                if let Some(actual_char) = String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .chars()
-                    .find(|c| c.is_ascii_alphabetic())
-                {
-                    let alt_root = PathBuf::from(format!(r"{}:\", actual_char));
-                    if alt_root.is_dir() {
-                        return Ok(alt_root);
-                    }
+    // Use UTF-16LE Base64 PowerShell to find the partition by label or disk number,
+    // force-assign a drive letter if MountMgr delayed it, and return the live root path.
+    let ps = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Update-HostStorageCache
+Update-Disk -Number {disk_num}
+for ($i = 0; $i -lt 25; $i++) {{
+    $vol = Get-Partition -DiskNumber {disk_num} | Get-Volume | Where-Object {{ $_.FileSystemLabel -eq '{vol_label}' }} | Select-Object -First 1
+    if ($vol) {{
+        $dl = [char]$vol.DriveLetter
+        if (-not [char]::IsLetter($dl)) {{
+            $part = Get-Partition -DiskNumber {disk_num} | Where-Object {{ ($_ | Get-Volume).FileSystemLabel -eq '{vol_label}' }} | Select-Object -First 1
+            if ($part) {{
+                Set-Partition -InputObject $part -NewDriveLetter '{preferred_letter}'
+                if (-not $?) {{
+                    Add-PartitionAccessPath -DiskNumber {disk_num} -PartitionNumber $part.PartitionNumber -AssignDriveLetter
+                }}
+                Start-Sleep -Milliseconds 400
+                $vol = Get-Partition -DiskNumber {disk_num} -PartitionNumber $part.PartitionNumber | Get-Volume
+                $dl = [char]$vol.DriveLetter
+            }}
+        }}
+        if ([char]::IsLetter($dl)) {{
+            $root = "{{0}}:\" -f $dl
+            if (Test-Path -LiteralPath $root) {{
+                Write-Output "USB_MOUNT:$root"
+                exit 0
+            }}
+        }}
+    }}
+    Start-Sleep -Milliseconds 350
+}}
+exit 1
+"#
+    );
+
+    if let Ok(out) = run_powershell_encoded(&ps) {
+        for line in out.lines() {
+            if let Some(root_str) = line.trim().strip_prefix("USB_MOUNT:") {
+                let p = PathBuf::from(root_str.trim());
+                if p.is_dir() {
+                    return Ok(p);
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(350));
+    }
+
+    if preferred_root.is_dir() {
+        return Ok(preferred_root);
     }
 
     anyhow::bail!(
-        "USB partition '{}' ({}:\\) did not come online after formatting. Please unplug and reconnect the USB drive.",
+        "USB partition '{}' on Disk {} did not mount a drive letter after formatting. Please unplug and reconnect the USB drive.",
         vol_label,
-        expected_letter
+        disk_num
     )
 }
 
@@ -698,7 +827,6 @@ where
     F: FnMut(FlashProgress),
 {
     use std::os::windows::process::CommandExt;
-    use std::process::Stdio;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     let Some(disk_num) = drive
@@ -721,6 +849,9 @@ where
         );
     }
 
+    // Release any raw volume locks before running diskpart / Mount-DiskImage
+    crate::platform::finish_device(None);
+
     on_progress(FlashProgress {
         phase: "Windows ISO: Mounting source ISO & waiting for UDF filesystem...",
         bytes_processed: 0,
@@ -728,127 +859,116 @@ where
         speed_mbps: 0.0,
     });
 
-    let _ = crate::platform::unmount_drive(drive);
-    crate::platform::finish_device(None);
+    let clean_iso_path = image_path
+        .canonicalize()
+        .unwrap_or_else(|_| image_path.to_path_buf());
+    let iso_str = clean_iso_path
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&clean_iso_path.to_string_lossy())
+        .replace('\'', "''");
 
-    let iso_str = image_path.to_string_lossy().replace('\'', "''");
-    // Mount ISO and poll until the UDF drive letter is live and readable (prevents os error 3 on source ISO)
     let mount_ps = format!(
-        "$img = Mount-DiskImage -ImagePath '{}' -PassThru -ErrorAction Stop; \
-         for ($i = 0; $i -lt 20; $i++) {{ \
-             $dl = (Get-DiskImage -ImagePath '{}' | Get-Volume -ErrorAction SilentlyContinue | Where-Object {{ $_.DriveLetter }} | Select-Object -First 1).DriveLetter; \
-             if ($dl -and (Test-Path \"$($dl):\\\")) {{ Write-Output $dl; break }}; \
-             Start-Sleep -Milliseconds 300 \
-         }}",
-        iso_str, iso_str
+        r#"
+$ErrorActionPreference = 'Stop'
+$isoPath = '{iso_str}'
+$img = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+if (-not $img -or -not $img.Attached) {{
+    $img = Mount-DiskImage -ImagePath $isoPath -PassThru -ErrorAction Stop
+}}
+for ($i = 0; $i -lt 30; $i++) {{
+    $vol = Get-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue | Get-Volume -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($vol) {{
+        $dl = [char]$vol.DriveLetter
+        if ([char]::IsLetter($dl)) {{
+            $root = "{{0}}:\" -f $dl
+            if (Test-Path -LiteralPath $root) {{
+                Write-Output "ISO_MOUNT:$root"
+                exit 0
+            }}
+        }}
+    }}
+    Start-Sleep -Milliseconds 300
+}}
+throw "Windows mounted the ISO image, but no drive letter was assigned to the virtual DVD drive."
+"#
     );
-    let out = Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-Command", &mount_ps])
-        .output()
-        .context("Failed to mount Windows ISO")?;
 
-    let iso_letter = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .chars()
-        .find(|c| c.is_ascii_alphabetic())
-        .ok_or_else(|| anyhow::anyhow!("Failed to obtain mounted Windows ISO drive letter"))?;
+    let mount_out = run_powershell_encoded(&mount_ps)
+        .context("Failed to mount Windows ISO image via PowerShell Mount-DiskImage")?;
+
+    let iso_root = mount_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ISO_MOUNT:"))
+        .map(|s| PathBuf::from(s.trim()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not determine mounted Windows ISO drive letter (output: {})",
+                mount_out
+            )
+        })?;
 
     struct WinIsoGuard(String);
     impl Drop for WinIsoGuard {
         fn drop(&mut self) {
-            let cmd = format!(
+            let dismount_ps = format!(
                 "Dismount-DiskImage -ImagePath '{}' -ErrorAction SilentlyContinue",
                 self.0
             );
-            let _ = Command::new("powershell")
-                .creation_flags(0x08000000)
-                .args(["-NoProfile", "-Command", &cmd])
-                .status();
+            let _ = run_powershell_encoded(&dismount_ps);
         }
     }
     let _guard = WinIsoGuard(iso_str);
 
-    let iso_root = PathBuf::from(format!(r"{}:\", iso_letter));
     let needs_dual = has_large_wim_file(&iso_root)?;
     let (efi_letter, data_letter) = find_two_free_drive_letters()?;
 
-    // Stage 1: Clean stale partition tables in a dedicated diskpart pass first so VDS refreshes cleanly
     on_progress(FlashProgress {
-        phase: "Windows ISO: Cleaning previous USB partition table...",
-        bytes_processed: 2,
+        phase: if needs_dual {
+            "Windows ISO: Partitioning USB (FAT32 WINBOOT + NTFS WINSETUP)..."
+        } else {
+            "Windows ISO: Formatting USB as FAT32 (WINSETUP)..."
+        },
+        bytes_processed: 4,
         total_bytes: 100,
         speed_mbps: 0.0,
     });
-    if let Ok(mut clean_dp) = Command::new("diskpart")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        if let Some(mut stdin) = clean_dp.stdin.take() {
-            let clean_script = format!(
-                "select disk {}\r\nattributes disk clear readonly\r\nclean\r\nrescan\r\nexit\r\n",
-                disk_num
-            );
-            let _ = stdin.write_all(clean_script.as_bytes());
-        }
-        let _ = clean_dp.wait();
-    }
-    std::thread::sleep(Duration::from_millis(600));
 
-    let convert_cmd = match scheme {
-        PartitionScheme::Mbr => "convert mbr",
-        PartitionScheme::Auto | PartitionScheme::Gpt => "convert gpt",
-    };
-    let active_cmd = if matches!(scheme, PartitionScheme::Mbr) {
-        "active\r\n"
-    } else {
-        ""
-    };
+    let dp_script = build_windows_diskpart_script(
+        disk_num,
+        scheme,
+        needs_dual,
+        drive.size_bytes,
+        efi_letter,
+        data_letter,
+    );
+    let dp_script_path = std::env::temp_dir().join(format!(
+        "bootlite_winiso_dp_{}_{}.txt",
+        disk_num,
+        std::process::id()
+    ));
+    fs::write(&dp_script_path, dp_script.as_bytes())
+        .context("Failed to write temporary diskpart script")?;
+
+    let dp_out = Command::new("diskpart")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["/s", &dp_script_path.to_string_lossy()])
+        .output()
+        .context("Failed to execute diskpart for Windows USB creation")?;
+    let _ = fs::remove_file(&dp_script_path);
+
+    if !dp_out.status.success() {
+        let dp_log = String::from_utf8_lossy(&dp_out.stdout).trim().to_string();
+        anyhow::bail!(
+            "diskpart failed while preparing USB drive (Disk {}): {}",
+            disk_num,
+            dp_log
+        );
+    }
 
     let stream_hash = if needs_dual {
-        on_progress(FlashProgress {
-            phase: "Windows ISO: Partitioning USB (FAT32 UEFI + NTFS Setup)...",
-            bytes_processed: 4,
-            total_bytes: 100,
-            speed_mbps: 0.0,
-        });
-
-        let mut dp = Command::new("diskpart")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to start diskpart for Windows USB creation")?;
-
-        if let Some(mut stdin) = dp.stdin.take() {
-            let script = format!(
-                "automount enable\r\n\
-                 select disk {}\r\n\
-                 {}\r\n\
-                 create partition primary size=900\r\n\
-                 format fs=fat32 label=\"WINBOOT\" quick\r\n\
-                 {}\
-                 assign letter={}\r\n\
-                 create partition primary\r\n\
-                 format fs=ntfs label=\"WINSETUP\" quick\r\n\
-                 assign letter={}\r\n\
-                 exit\r\n",
-                disk_num, convert_cmd, active_cmd, efi_letter, data_letter
-            );
-            let _ = stdin.write_all(script.as_bytes());
-        }
-        let status = dp.wait()?;
-        if !status.success() {
-            anyhow::bail!("diskpart failed to create FAT32 + NTFS Windows boot layout");
-        }
-
-        // Wait & verify both USB partitions are mounted in Win32 namespace before copying files
-        let efi_mount = wait_for_windows_usb_mount(disk_num, "WINBOOT", efi_letter)?;
-        let data_mount = wait_for_windows_usb_mount(disk_num, "WINSETUP", data_letter)?;
+        let efi_mount = resolve_and_wait_for_usb_partition(disk_num, "WINBOOT", efi_letter)?;
+        let data_mount = resolve_and_wait_for_usb_partition(disk_num, "WINSETUP", data_letter)?;
 
         copy_and_verify_windows_tree(
             &iso_root,
@@ -860,47 +980,7 @@ where
             &mut on_progress,
         )?
     } else {
-        on_progress(FlashProgress {
-            phase: "Windows ISO: Formatting USB as FAT32 (WINSETUP)...",
-            bytes_processed: 4,
-            total_bytes: 100,
-            speed_mbps: 0.0,
-        });
-
-        let create_part_cmd = if drive.size_bytes > 32 * 1024 * 1024 * 1024 {
-            "create partition primary size=32000"
-        } else {
-            "create partition primary"
-        };
-
-        let mut dp = Command::new("diskpart")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to start diskpart for FAT32 Windows USB creation")?;
-
-        if let Some(mut stdin) = dp.stdin.take() {
-            let script = format!(
-                "automount enable\r\n\
-                 select disk {}\r\n\
-                 {}\r\n\
-                 {}\r\n\
-                 format fs=fat32 label=\"WINSETUP\" quick\r\n\
-                 {}\
-                 assign letter={}\r\n\
-                 exit\r\n",
-                disk_num, convert_cmd, create_part_cmd, active_cmd, data_letter
-            );
-            let _ = stdin.write_all(script.as_bytes());
-        }
-        let status = dp.wait()?;
-        if !status.success() {
-            anyhow::bail!("diskpart failed to create FAT32 Windows boot layout");
-        }
-
-        let data_mount = wait_for_windows_usb_mount(disk_num, "WINSETUP", data_letter)?;
+        let data_mount = resolve_and_wait_for_usb_partition(disk_num, "WINSETUP", data_letter)?;
         copy_and_verify_windows_tree(
             &iso_root,
             None,
@@ -1129,4 +1209,45 @@ where
     };
 
     Ok(stream_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_powershell_utf16le_base64_encoding() {
+        // "Write-Output 'OK'" in UTF-16LE Base64
+        let encoded = encode_powershell_utf16le_base64("Write-Output 'OK'");
+        assert_eq!(encoded, "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAnAE8ASwAnAA==");
+    }
+
+    #[test]
+    fn test_diskpart_script_never_calls_convert_mbr_after_clean() {
+        let auto_script = build_windows_diskpart_script(
+            2,
+            PartitionScheme::Auto,
+            true,
+            32 * 1024 * 1024 * 1024,
+            'Y',
+            'Z',
+        );
+        assert!(auto_script.contains("select disk 2"));
+        assert!(auto_script.contains("clean\r\n"));
+        assert!(!auto_script.contains("convert mbr"));
+        assert!(!auto_script.contains("convert gpt"));
+        assert!(auto_script.contains("format fs=fat32 label=\"WINBOOT\" quick"));
+        assert!(auto_script.contains("format fs=ntfs label=\"WINSETUP\" quick"));
+
+        let gpt_script = build_windows_diskpart_script(
+            2,
+            PartitionScheme::Gpt,
+            true,
+            32 * 1024 * 1024 * 1024,
+            'Y',
+            'Z',
+        );
+        assert!(gpt_script.contains("convert gpt\r\n"));
+        assert!(!gpt_script.contains("active\r\n"));
+    }
 }

@@ -542,7 +542,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.4 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.5 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -1078,7 +1078,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.4",
+                                "v0.6.5",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -2593,7 +2593,7 @@ impl eframe::App for BootLiteApp {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("BootLite Studio").size(16.0).strong().color(TEXT_MAIN));
-                                draw_pill(ui, "v0.6.4", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
+                                draw_pill(ui, "v0.6.5", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
                             });
                             ui.label(RichText::new("High-Performance Native Rust USB Flasher & Windows Deployment Studio").size(11.0).color(TEXT_SUB));
                         });
@@ -2624,7 +2624,7 @@ impl eframe::App for BootLiteApp {
                             open_external_url("https://github.com/namanrathi07/bootlite/issues/new/choose");
                         }
                         if small_slate_button(ui, "📋 Copy Info").clicked() {
-                            ctx.copy_text("BootLite v0.6.4 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
+                            ctx.copy_text("BootLite v0.6.5 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
