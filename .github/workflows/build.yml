@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Linux GUI system dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -65,7 +65,7 @@ jobs:
           tar -czvf ../../../${{ matrix.release_file }} BootLite bootlite-cli
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os }}-package
           path: ${{ matrix.release_file }}
