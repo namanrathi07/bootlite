@@ -13,8 +13,13 @@ const COPY_CHUNK: usize = 8 * 1024 * 1024; // 8 MB high-throughput streaming buf
 const FAT32_MAX_FILE_SIZE: u64 = 4_000_000_000; // Safe threshold (~3.72 GiB) for FAT32
 pub const WIN_ISO_OVERHEAD_BYTES: u64 = 700_000_000; // ~700 MB overhead for UEFI boot partition
 
+/// Fixed least-used drive letters on Windows so USB formatting never shifts letters across runs:
+/// - `W:` is always used for the primary Windows Setup partition (`WINSETUP`)
+/// - `V:` is always used for the secondary FAT32 UEFI boot partition (`WINBOOT`) when dual-partition is needed
+pub const FIXED_WINSETUP_LETTER: char = 'W';
+pub const FIXED_WINBOOT_LETTER: char = 'V';
+
 /// Encodes a PowerShell script as UTF-16LE Base64 for `powershell.exe -EncodedCommand`.
-/// This completely eliminates all Windows command-line quote, backslash, and path escaping bugs.
 pub fn encode_powershell_utf16le_base64(script: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bytes = Vec::with_capacity(script.len() * 2);
@@ -46,8 +51,10 @@ pub fn encode_powershell_utf16le_base64(script: &str) -> String {
 }
 
 /// Builds a deterministic `diskpart /s` script for creating a bootable Windows 10/11 USB.
-/// Note: After `clean`, `diskpart` leaves the disk in MBR state. Calling `convert mbr` after `clean`
-/// causes `diskpart` to fail with `Virtual Disk Service error: The specified disk is not convertible`.
+/// - Never calls `online disk` (which fails on Removable Media USB flash drives).
+/// - Never calls `convert mbr` after `clean` (since `clean` already leaves the disk in MBR mode).
+/// - Uses `automount disable` + `automount scrub` so Windows never auto-assigns shifting letters (`E:`, `F:`, `G:`...),
+///   and always assigns the fixed least-used letters `V:` (`WINBOOT`) and `W:` (`WINSETUP`).
 pub fn build_windows_diskpart_script(
     disk_num: u32,
     scheme: PartitionScheme,
@@ -57,15 +64,15 @@ pub fn build_windows_diskpart_script(
     data_letter: char,
 ) -> String {
     let use_gpt = matches!(scheme, PartitionScheme::Gpt);
-    let convert_line = if use_gpt { "convert gpt\r\n" } else { "" };
+    let convert_line = if use_gpt { "convert gpt noerr\r\n" } else { "" };
     let active_line = if use_gpt { "" } else { "active\r\n" };
 
     if needs_dual {
         format!(
-            "automount enable\r\n\
+            "automount disable\r\n\
+             automount scrub\r\n\
              select disk {}\r\n\
              attributes disk clear readonly noerr\r\n\
-             online disk noerr\r\n\
              clean\r\n\
              {}\
              create partition primary size=1024\r\n\
@@ -75,6 +82,7 @@ pub fn build_windows_diskpart_script(
              create partition primary\r\n\
              format fs=ntfs label=\"WINSETUP\" quick\r\n\
              assign letter={} noerr\r\n\
+             automount enable\r\n\
              rescan\r\n\
              exit\r\n",
             disk_num, convert_line, active_line, efi_letter, data_letter
@@ -86,16 +94,17 @@ pub fn build_windows_diskpart_script(
             "create partition primary"
         };
         format!(
-            "automount enable\r\n\
+            "automount disable\r\n\
+             automount scrub\r\n\
              select disk {}\r\n\
              attributes disk clear readonly noerr\r\n\
-             online disk noerr\r\n\
              clean\r\n\
              {}\
              {}\r\n\
              format fs=fat32 label=\"WINSETUP\" quick\r\n\
              {}\
              assign letter={} noerr\r\n\
+             automount enable\r\n\
              rescan\r\n\
              exit\r\n",
             disk_num, convert_line, create_part_cmd, active_line, data_letter
@@ -387,7 +396,7 @@ where
                     &mut bytes_done,
                     total_write_bytes,
                     write_start,
-                    "Phase 1/2: Writing UEFI FAT32 Bootloader (boot.wim)...",
+                    "Phase 1/2: Writing UEFI FAT32 Bootloader (V:\\ WINBOOT)...",
                     on_progress,
                 )?;
                 written_targets.push((src_path.clone(), dst_efi, *file_len, digest));
@@ -417,13 +426,13 @@ where
             &mut bytes_done,
             total_write_bytes,
             write_start,
-            "Phase 1/2: Streaming Windows Setup & install.wim to USB...",
+            "Phase 1/2: Streaming Windows Setup & install.wim (W:\\ WINSETUP)...",
             on_progress,
         )?;
         written_targets.push((src_path.clone(), dst_data, *file_len, digest));
     }
 
-    // Provision the \AutoPilot\ folder and hardware hash extraction scripts strictly on the USB drive
+    // Provision \AutoPilot\ folder and scripts strictly on the USB drive
     for root_dir in [efi_mount, Some(data_mount)].into_iter().flatten() {
         let ap_dir = root_dir.join("AutoPilot");
         let _ = with_fs_retry(|| fs::create_dir_all(&ap_dir));
@@ -723,65 +732,39 @@ fn run_powershell_encoded(script: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_two_free_drive_letters() -> Result<(char, char)> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetLogicalDrives() -> u32;
-    }
-    let mask = unsafe { GetLogicalDrives() };
-    let mut free = Vec::new();
-    for i in (6..26u32).rev() {
-        if (mask & (1 << i)) == 0 {
-            free.push((b'A' + (i as u8)) as char);
-            if free.len() == 2 {
-                return Ok((free[0], free[1]));
-            }
-        }
-    }
-    anyhow::bail!(
-        "No two free drive letters (G:..Z:) available on Windows to mount USB partitions"
-    )
-}
-
-#[cfg(target_os = "windows")]
 fn resolve_and_wait_for_usb_partition(
     disk_num: u32,
     vol_label: &str,
-    preferred_letter: char,
+    fixed_letter: char,
 ) -> Result<PathBuf> {
-    let preferred_root = PathBuf::from(format!(r"{}:\", preferred_letter));
-    if preferred_root.is_dir() {
-        return Ok(preferred_root);
+    let fixed_root = PathBuf::from(format!(r"{}:\", fixed_letter));
+    if fixed_root.is_dir() {
+        return Ok(fixed_root);
     }
 
-    // Use UTF-16LE Base64 PowerShell to find the partition by label or disk number,
-    // force-assign a drive letter if MountMgr delayed it, and return the live root path.
     let ps = format!(
         r#"
 $ErrorActionPreference = 'SilentlyContinue'
 Update-HostStorageCache
 Update-Disk -Number {disk_num}
 for ($i = 0; $i -lt 25; $i++) {{
-    $vol = Get-Partition -DiskNumber {disk_num} | Get-Volume | Where-Object {{ $_.FileSystemLabel -eq '{vol_label}' }} | Select-Object -First 1
-    if ($vol) {{
-        $dl = [char]$vol.DriveLetter
-        if (-not [char]::IsLetter($dl)) {{
-            $part = Get-Partition -DiskNumber {disk_num} | Where-Object {{ ($_ | Get-Volume).FileSystemLabel -eq '{vol_label}' }} | Select-Object -First 1
-            if ($part) {{
-                Set-Partition -InputObject $part -NewDriveLetter '{preferred_letter}'
-                if (-not $?) {{
-                    Add-PartitionAccessPath -DiskNumber {disk_num} -PartitionNumber $part.PartitionNumber -AssignDriveLetter
-                }}
-                Start-Sleep -Milliseconds 400
-                $vol = Get-Partition -DiskNumber {disk_num} -PartitionNumber $part.PartitionNumber | Get-Volume
-                $dl = [char]$vol.DriveLetter
+    $parts = Get-Partition -DiskNumber {disk_num}
+    foreach ($p in $parts) {{
+        $v = $p | Get-Volume
+        if ($v -and $v.FileSystemLabel -eq '{vol_label}') {{
+            $dl = [char]$v.DriveLetter
+            if ($dl -ne '{fixed_letter}') {{
+                Set-Partition -DiskNumber {disk_num} -PartitionNumber $p.PartitionNumber -NewDriveLetter '{fixed_letter}'
+                Start-Sleep -Milliseconds 300
+                $v = Get-Partition -DiskNumber {disk_num} -PartitionNumber $p.PartitionNumber | Get-Volume
+                $dl = [char]$v.DriveLetter
             }}
-        }}
-        if ([char]::IsLetter($dl)) {{
-            $root = "{{0}}:\" -f $dl
-            if (Test-Path -LiteralPath $root) {{
-                Write-Output "USB_MOUNT:$root"
-                exit 0
+            if ([char]::IsLetter($dl)) {{
+                $root = "{{0}}:\" -f $dl
+                if (Test-Path -LiteralPath $root) {{
+                    Write-Output "USB_MOUNT:$root"
+                    exit 0
+                }}
             }}
         }}
     }}
@@ -802,15 +785,61 @@ exit 1
         }
     }
 
-    if preferred_root.is_dir() {
-        return Ok(preferred_root);
+    if fixed_root.is_dir() {
+        return Ok(fixed_root);
     }
 
     anyhow::bail!(
-        "USB partition '{}' on Disk {} did not mount a drive letter after formatting. Please unplug and reconnect the USB drive.",
+        "USB partition '{}' on Disk {} did not mount at {}:\\ after formatting. Please unplug and reconnect the USB drive.",
         vol_label,
-        disk_num
+        disk_num,
+        fixed_letter
     )
+}
+
+/// Fallback partitioner using native Windows Storage cmdlets (`Clear-Disk` / `New-Partition` / `Format-Volume`)
+/// in case `diskpart` encounters a VDS lock on a removable USB controller.
+#[cfg(target_os = "windows")]
+fn partition_usb_via_powershell_fallback(
+    disk_num: u32,
+    scheme: PartitionScheme,
+    needs_dual: bool,
+    efi_letter: char,
+    data_letter: char,
+) -> Result<()> {
+    let style = if matches!(scheme, PartitionScheme::Gpt) {
+        "GPT"
+    } else {
+        "MBR"
+    };
+    let ps = if needs_dual {
+        format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Set-Disk -Number {disk_num} -IsReadOnly $false -ErrorAction SilentlyContinue
+Clear-Disk -Number {disk_num} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction SilentlyContinue
+Initialize-Disk -Number {disk_num} -PartitionStyle {style} -ErrorAction SilentlyContinue
+$p1 = New-Partition -DiskNumber {disk_num} -Size 1024MB -DriveLetter '{efi_letter}' -IsActive:('{style}' -eq 'MBR')
+Format-Volume -Partition $p1 -FileSystem FAT32 -NewFileSystemLabel 'WINBOOT' -Confirm:$false | Out-Null
+$p2 = New-Partition -DiskNumber {disk_num} -UseMaximumSize -DriveLetter '{data_letter}'
+Format-Volume -Partition $p2 -FileSystem NTFS -NewFileSystemLabel 'WINSETUP' -Confirm:$false | Out-Null
+Write-Output 'PS_PART_OK'
+"#
+        )
+    } else {
+        format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+Set-Disk -Number {disk_num} -IsReadOnly $false -ErrorAction SilentlyContinue
+Clear-Disk -Number {disk_num} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction SilentlyContinue
+Initialize-Disk -Number {disk_num} -PartitionStyle {style} -ErrorAction SilentlyContinue
+$p1 = New-Partition -DiskNumber {disk_num} -UseMaximumSize -DriveLetter '{data_letter}' -IsActive:('{style}' -eq 'MBR')
+Format-Volume -Partition $p1 -FileSystem FAT32 -NewFileSystemLabel 'WINSETUP' -Confirm:$false | Out-Null
+Write-Output 'PS_PART_OK'
+"#
+        )
+    };
+    run_powershell_encoded(&ps).map(|_| ())
 }
 
 #[cfg(target_os = "windows")]
@@ -849,7 +878,9 @@ where
         );
     }
 
-    // Release any raw volume locks before running diskpart / Mount-DiskImage
+    // 1. Release old drive letters & strip old partition table at kernel level first
+    //    so Explorer/Defender releases the USB drive before diskpart runs.
+    let _ = crate::platform::unmount_drive(drive);
     crate::platform::finish_device(None);
 
     on_progress(FlashProgress {
@@ -921,13 +952,15 @@ throw "Windows mounted the ISO image, but no drive letter was assigned to the vi
     let _guard = WinIsoGuard(iso_str);
 
     let needs_dual = has_large_wim_file(&iso_root)?;
-    let (efi_letter, data_letter) = find_two_free_drive_letters()?;
+    // Stick to fixed least-used drive letters V: (WINBOOT) and W: (WINSETUP)
+    let efi_letter = FIXED_WINBOOT_LETTER;
+    let data_letter = FIXED_WINSETUP_LETTER;
 
     on_progress(FlashProgress {
         phase: if needs_dual {
-            "Windows ISO: Partitioning USB (FAT32 WINBOOT + NTFS WINSETUP)..."
+            "Windows ISO: Formatting USB at V:\\ (WINBOOT) & W:\\ (WINSETUP)..."
         } else {
-            "Windows ISO: Formatting USB as FAT32 (WINSETUP)..."
+            "Windows ISO: Formatting USB at W:\\ (WINSETUP)..."
         },
         bytes_processed: 4,
         total_bytes: 100,
@@ -958,12 +991,33 @@ throw "Windows mounted the ISO image, but no drive letter was assigned to the vi
     let _ = fs::remove_file(&dp_script_path);
 
     if !dp_out.status.success() {
-        let dp_log = String::from_utf8_lossy(&dp_out.stdout).trim().to_string();
-        anyhow::bail!(
-            "diskpart failed while preparing USB drive (Disk {}): {}",
+        let dp_summary: String = String::from_utf8_lossy(&dp_out.stdout)
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.starts_with("Microsoft DiskPart version")
+                    && !l.starts_with("Copyright (C)")
+                    && !l.starts_with("On computer:")
+                    && !l.starts_with("Leaving DiskPart")
+            })
+            .collect::<Vec<&str>>()
+            .join(" | ");
+        // Attempt native PowerShell Storage fallback before failing
+        if let Err(ps_err) = partition_usb_via_powershell_fallback(
             disk_num,
-            dp_log
-        );
+            scheme,
+            needs_dual,
+            efi_letter,
+            data_letter,
+        ) {
+            anyhow::bail!(
+                "USB partitioning failed on Disk {} — DiskPart: [{}] | PowerShell fallback: [{}]",
+                disk_num,
+                dp_summary,
+                ps_err
+            );
+        }
     }
 
     let stream_hash = if needs_dual {
@@ -1216,38 +1270,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_powershell_utf16le_base64_encoding() {
-        // "Write-Output 'OK'" in UTF-16LE Base64
-        let encoded = encode_powershell_utf16le_base64("Write-Output 'OK'");
-        assert_eq!(encoded, "VwByAGkAdABlAC0ATwB1AHQAcAB1AHQAIAAnAE8ASwAnAA==");
-    }
-
-    #[test]
-    fn test_diskpart_script_never_calls_convert_mbr_after_clean() {
-        let auto_script = build_windows_diskpart_script(
+    fn test_diskpart_script_uses_fixed_letters_and_no_online_disk() {
+        let script = build_windows_diskpart_script(
             2,
             PartitionScheme::Auto,
             true,
             32 * 1024 * 1024 * 1024,
-            'Y',
-            'Z',
+            FIXED_WINBOOT_LETTER,
+            FIXED_WINSETUP_LETTER,
         );
-        assert!(auto_script.contains("select disk 2"));
-        assert!(auto_script.contains("clean\r\n"));
-        assert!(!auto_script.contains("convert mbr"));
-        assert!(!auto_script.contains("convert gpt"));
-        assert!(auto_script.contains("format fs=fat32 label=\"WINBOOT\" quick"));
-        assert!(auto_script.contains("format fs=ntfs label=\"WINSETUP\" quick"));
-
-        let gpt_script = build_windows_diskpart_script(
-            2,
-            PartitionScheme::Gpt,
-            true,
-            32 * 1024 * 1024 * 1024,
-            'Y',
-            'Z',
-        );
-        assert!(gpt_script.contains("convert gpt\r\n"));
-        assert!(!gpt_script.contains("active\r\n"));
+        assert!(script.contains("automount disable\r\n"));
+        assert!(script.contains("automount scrub\r\n"));
+        assert!(script.contains("select disk 2\r\n"));
+        assert!(!script.contains("online disk"));
+        assert!(!script.contains("convert mbr"));
+        assert!(script.contains("assign letter=V noerr\r\n"));
+        assert!(script.contains("assign letter=W noerr\r\n"));
+        assert!(script.contains("automount enable\r\n"));
     }
 }

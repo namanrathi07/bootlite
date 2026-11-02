@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="BootLite"
-VERSION="0.6.5"
+VERSION="0.6.6"
 TARGET="aarch64-apple-darwin"
 BUNDLE_DIR="dist/${APP_NAME}.app"
 DMG_PATH="dist/${APP_NAME}-macOS-AppleSilicon.dmg"

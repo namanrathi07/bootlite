@@ -468,7 +468,34 @@ fn main() -> eframe::Result<()> {
             let mut style = (*cc.egui_ctx.style()).clone();
             style.spacing.item_spacing = Vec2::new(8.0, 6.0);
             style.spacing.button_padding = Vec2::new(10.0, 5.0);
-            let mut visuals = egui::Visuals::dark();
+            style.spacing.scroll.floating = false;
+            style.spacing.scroll.bar_width = 10.0;
+            style.spacing.scroll.handle_min_length = 28.0;
+            style.spacing.scroll.bar_inner_margin = 2.0;
+            style.spacing.scroll.bar_outer_margin = 2.0;
+            style.spacing.scroll.foreground_color = true;
+
+        let mut visuals = egui::Visuals::dark();
+        visuals.widgets.noninteractive.bg_fill = BG_CARD;
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_MAIN);
+        visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 41, 59);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 41, 59);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85));
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_MAIN);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(7.0);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 99, 235);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(37, 99, 235);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.5_f32, Color32::from_rgb(96, 165, 250));
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(7.0);
+        visuals.widgets.hovered.expansion = 1.5;
+        visuals.widgets.active.bg_fill = Color32::from_rgb(29, 78, 216);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(29, 78, 216);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.active.rounding = egui::Rounding::same(7.0);
+        visuals.selection.bg_fill = Color32::from_rgb(37, 99, 235);
+        visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
             visuals.panel_fill = BG_APP;
             visuals.window_fill = BG_CARD;
             visuals.window_rounding = 12.0.into();
@@ -542,7 +569,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.5 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.6 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -1078,7 +1105,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.5",
+                                "v0.6.6",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -2135,8 +2162,10 @@ impl eframe::App for BootLiteApp {
                         .inner_margin(10.0)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
                                 .id_salt("hardware_log_console")
+                                .auto_shrink([false, false])
+                                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                                 .max_height(remaining_h)
                                 .min_scrolled_height(remaining_h)
                                 .stick_to_bottom(true)
@@ -2593,7 +2622,7 @@ impl eframe::App for BootLiteApp {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("BootLite Studio").size(16.0).strong().color(TEXT_MAIN));
-                                draw_pill(ui, "v0.6.5", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
+                                draw_pill(ui, "v0.6.6", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
                             });
                             ui.label(RichText::new("High-Performance Native Rust USB Flasher & Windows Deployment Studio").size(11.0).color(TEXT_SUB));
                         });
@@ -2624,7 +2653,7 @@ impl eframe::App for BootLiteApp {
                             open_external_url("https://github.com/namanrathi07/bootlite/issues/new/choose");
                         }
                         if small_slate_button(ui, "📋 Copy Info").clicked() {
-                            ctx.copy_text("BootLite v0.6.5 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
+                            ctx.copy_text("BootLite v0.6.6 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

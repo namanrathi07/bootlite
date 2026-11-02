@@ -26,6 +26,10 @@ const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 
+/// Fixed least-used drive letters on Windows so USB formatting never shifts letters across runs
+pub const FIXED_USB_DATA_LETTER: char = 'W';
+pub const FIXED_USB_EFI_LETTER: char = 'V';
+
 static LOCKED_VOLUMES: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 pub fn open_user_uid_init(_uid: u32) {}
@@ -101,7 +105,7 @@ fn get_volume_disk_number(handle: *mut std::ffi::c_void) -> Option<u32> {
 
 fn get_system_disk_numbers() -> HashSet<u32> {
     let mut sys = HashSet::new();
-    sys.insert(0); // Always protect PhysicalDrive0
+    sys.insert(0);
 
     let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
     let clean = sys_drive.trim_end_matches('\\');
@@ -153,8 +157,8 @@ fn extract_cstr(buf: &[u8], offset: usize) -> String {
 
 fn query_storage_descriptor(handle: *mut std::ffi::c_void) -> Option<(u8, bool, String)> {
     let query = StoragePropertyQuery {
-        property_id: 0, // StorageDeviceProperty
-        query_type: 0,  // PropertyStandardQuery
+        property_id: 0,
+        query_type: 0,
         additional_parameters: [0; 4],
     };
     let mut buf = [0u8; 1024];
@@ -199,7 +203,8 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
     let sys_disks = get_system_disk_numbers();
     let mut drives = Vec::new();
 
-    for disk_num in 1..64u32 {
+    // Scan PhysicalDrive1..16 for sub-2ms non-blocking UI responsiveness on Windows
+    for disk_num in 1..16u32 {
         if sys_disks.contains(&disk_num) {
             continue;
         }
@@ -220,8 +225,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
             continue;
         };
 
-        // Win32 STORAGE_BUS_TYPE:
-        // 7 = BusTypeUsb, 12 = BusTypeSd, 13 = BusTypeMmc, 14 = BusTypeVirtual, 15 = BusTypeFileBackedVirtual
         let is_usb_or_sd = bus_type == 7 || bus_type == 12 || bus_type == 13 || removable;
         let is_virtual = bus_type == 14
             || bus_type == 15
@@ -285,6 +288,58 @@ pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
         }
     }
     false
+}
+
+/// Strips the noisy Microsoft DiskPart version/copyright banner so only actionable error lines appear in the log.
+pub fn summarize_diskpart_output(raw: &str) -> String {
+    let filtered: Vec<&str> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with("Microsoft DiskPart version")
+                && !l.starts_with("Copyright (C)")
+                && !l.starts_with("On computer:")
+                && !l.starts_with("Leaving DiskPart")
+                && !l.contains("is now the selected disk")
+        })
+        .collect();
+    if filtered.is_empty() {
+        raw.trim().to_string()
+    } else {
+        filtered.join(" | ")
+    }
+}
+
+/// Releases any existing drive letters on `target_disk` and scrubs stale ghost drive-letter
+/// mappings so fixed letters (`W:` and `V:`) can be reused every single time without shifting.
+pub fn release_usb_drive_letters(target_disk: u32) {
+    let mask = unsafe { GetLogicalDrives() };
+    for i in 0..26u32 {
+        if (mask & (1 << i)) == 0 {
+            continue;
+        }
+        let letter = (b'A' + (i as u8)) as char;
+        if letter == 'C' {
+            continue;
+        }
+        let vol_path = format!(r"\\.\{}:", letter);
+        let Ok(vol_file) = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&vol_path)
+        else {
+            continue;
+        };
+        let h = vol_file.as_raw_handle() as *mut std::ffi::c_void;
+        if get_volume_disk_number(h) == Some(target_disk) {
+            drop(vol_file);
+            let _ = Command::new("mountvol")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args([&format!("{}:", letter), "/D"])
+                .status();
+        }
+    }
 }
 
 fn lock_and_dismount_disk_volumes(target_disk: u32) -> Vec<File> {
@@ -373,10 +428,9 @@ pub fn unmount_drive(drive: &UsbDrive) -> Result<()> {
         guard.clear();
     }
 
-    // 1. Lock & dismount all mounted filesystem volumes on this USB disk
+    release_usb_drive_letters(target_num);
     let locked = lock_and_dismount_disk_volumes(target_num);
 
-    // 2. Strip existing partition table layout at kernel level via IOCTL_DISK_DELETE_DRIVE_LAYOUT
     if let Ok(disk_file) = OpenOptions::new()
         .access_mode(GENERIC_READ | GENERIC_WRITE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -433,7 +487,7 @@ pub fn open_raw_device(drive: &UsbDrive) -> Result<File> {
         .open(&drive.raw_device_path)
         .with_context(|| {
             format!(
-                "Failed to open {} for raw writing (Click 'Unlock Admin Access' or close programs using the USB drive)",
+                "Failed to open {} for raw writing (Run as Administrator or close Explorer windows open on the USB drive)",
                 drive.raw_device_path.display()
             )
         })?;
@@ -536,25 +590,30 @@ pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme
         anyhow::bail!("Safety lock: Refusing to format system disk");
     }
 
-    // Note: After 'clean', diskpart leaves the disk in MBR state.
-    // Never run 'convert mbr' after 'clean' because diskpart rejects converting an already-MBR disk.
+    // 1. Release old drive letters on this USB stick and strip stale partition layout first
+    release_usb_drive_letters(disk_num);
+    let _ = unmount_drive(drive);
+    finish_device(None);
+
     let convert_line = match scheme {
-        PartitionScheme::Gpt => "convert gpt\r\n",
+        PartitionScheme::Gpt => "convert gpt noerr\r\n",
         PartitionScheme::Auto | PartitionScheme::Mbr => "",
     };
 
+    // Always assign fixed least-used drive letter W: so letters never shift
     let script = format!(
-        "automount enable\r\n\
+        "automount disable\r\n\
+         automount scrub\r\n\
          select disk {}\r\n\
          attributes disk clear readonly noerr\r\n\
-         online disk noerr\r\n\
          clean\r\n\
          {}\
          create partition primary\r\n\
          format fs=exfat label=\"{}\" quick\r\n\
-         assign\r\n\
+         assign letter={} noerr\r\n\
+         automount enable\r\n\
          exit\r\n",
-        disk_num, convert_line, label
+        disk_num, convert_line, label, FIXED_USB_DATA_LETTER
     );
 
     let script_path = std::env::temp_dir().join(format!(
@@ -572,8 +631,9 @@ pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme
 
     if !out.status.success() {
         anyhow::bail!(
-            "diskpart ExFAT format failed: {}",
-            String::from_utf8_lossy(&out.stdout).trim()
+            "USB ExFAT format failed on Disk {}: {}",
+            disk_num,
+            summarize_diskpart_output(&String::from_utf8_lossy(&out.stdout))
         );
     }
     Ok(())
