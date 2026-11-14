@@ -26,7 +26,7 @@ const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D1400;
 const IOCTL_DISK_DELETE_DRIVE_LAYOUT: u32 = 0x0007C100;
 const IOCTL_DISK_UPDATE_PROPERTIES: u32 = 0x00070140;
 
-/// Fixed least-used drive letters on Windows so USB formatting never shifts letters across runs
+/// Fixed least-used drive letters on Windows so USB formatting sticks to W: (and V:) every time
 pub const FIXED_USB_DATA_LETTER: char = 'W';
 pub const FIXED_USB_EFI_LETTER: char = 'V';
 
@@ -203,7 +203,6 @@ pub fn list_safe_usb_drives(allow_virtual: bool) -> Result<Vec<UsbDrive>> {
     let sys_disks = get_system_disk_numbers();
     let mut drives = Vec::new();
 
-    // Scan PhysicalDrive1..16 for sub-2ms non-blocking UI responsiveness on Windows
     for disk_num in 1..16u32 {
         if sys_disks.contains(&disk_num) {
             continue;
@@ -290,7 +289,6 @@ pub fn is_path_on_drive(path: &Path, drive: &UsbDrive) -> bool {
     false
 }
 
-/// Strips the noisy Microsoft DiskPart version/copyright banner so only actionable error lines appear in the log.
 pub fn summarize_diskpart_output(raw: &str) -> String {
     let filtered: Vec<&str> = raw
         .lines()
@@ -311,8 +309,6 @@ pub fn summarize_diskpart_output(raw: &str) -> String {
     }
 }
 
-/// Releases any existing drive letters on `target_disk` and scrubs stale ghost drive-letter
-/// mappings so fixed letters (`W:` and `V:`) can be reused every single time without shifting.
 pub fn release_usb_drive_letters(target_disk: u32) {
     let mask = unsafe { GetLogicalDrives() };
     for i in 0..26u32 {
@@ -590,51 +586,51 @@ pub fn format_drive_exfat(drive: &UsbDrive, label: &str, scheme: PartitionScheme
         anyhow::bail!("Safety lock: Refusing to format system disk");
     }
 
-    // 1. Release old drive letters on this USB stick and strip stale partition layout first
-    release_usb_drive_letters(disk_num);
+    // 1. Release existing drive letters on this USB drive and wipe partition layout
     let _ = unmount_drive(drive);
     finish_device(None);
 
-    let convert_line = match scheme {
-        PartitionScheme::Gpt => "convert gpt noerr\r\n",
-        PartitionScheme::Auto | PartitionScheme::Mbr => "",
+    let style = if matches!(scheme, PartitionScheme::Gpt) {
+        "GPT"
+    } else {
+        "MBR"
     };
 
-    // Always assign fixed least-used drive letter W: so letters never shift
-    let script = format!(
-        "automount disable\r\n\
-         automount scrub\r\n\
-         select disk {}\r\n\
-         attributes disk clear readonly noerr\r\n\
-         clean\r\n\
-         {}\
-         create partition primary\r\n\
-         format fs=exfat label=\"{}\" quick\r\n\
-         assign letter={} noerr\r\n\
-         automount enable\r\n\
-         exit\r\n",
-        disk_num, convert_line, label, FIXED_USB_DATA_LETTER
+    // 2. Synchronous PowerShell Storage Engine: sticks to fixed least-used drive letter W:
+    let ps = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$used = (Get-Volume | Where-Object {{ $_.DriveLetter }}).DriveLetter
+$letter = 'W'
+if ($used -contains $letter) {{
+    foreach ($cand in @('U','T','S','R','Q','P','O','N','M')) {{
+        if ($used -notcontains $cand) {{ $letter = $cand; break }}
+    }}
+}}
+try {{ Clear-Disk -Number {disk_num} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop }} catch {{}}
+Initialize-Disk -Number {disk_num} -PartitionStyle {style} -ErrorAction SilentlyContinue
+$p = New-Partition -DiskNumber {disk_num} -UseMaximumSize -DriveLetter $letter
+Format-Volume -Partition $p -FileSystem ExFAT -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null
+"#
     );
 
-    let script_path = std::env::temp_dir().join(format!(
-        "bootlite_fmt_{}_{}.txt",
-        disk_num,
-        std::process::id()
-    ));
-    std::fs::write(&script_path, script.as_bytes())?;
-    let out = Command::new("diskpart")
+    let encoded = crate::windows_iso::encode_powershell_utf16le_base64(&ps);
+    let out = Command::new("powershell")
         .creation_flags(CREATE_NO_WINDOW)
-        .args(["/s", &script_path.to_string_lossy()])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encoded,
+        ])
         .output()
-        .context("Failed to execute diskpart for ExFAT format")?;
-    let _ = std::fs::remove_file(&script_path);
+        .context("Failed to execute Windows Storage PowerShell for ExFAT format")?;
 
     if !out.status.success() {
-        anyhow::bail!(
-            "USB ExFAT format failed on Disk {}: {}",
-            disk_num,
-            summarize_diskpart_output(&String::from_utf8_lossy(&out.stdout))
-        );
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        anyhow::bail!("USB ExFAT format failed on Disk {}: {}", disk_num, err);
     }
     Ok(())
 }

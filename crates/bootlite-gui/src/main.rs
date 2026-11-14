@@ -288,7 +288,7 @@ fn open_external_url(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(url).spawn();
+        let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
     }
 }
 
@@ -453,8 +453,8 @@ fn build_window_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([740.0, 770.0])
-            .with_min_inner_size([660.0, 640.0])
+            .with_inner_size([880.0, 640.0])
+            .with_min_inner_size([680.0, 500.0])
             .with_resizable(true)
             .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(build_window_icon())),
@@ -502,7 +502,9 @@ fn main() -> eframe::Result<()> {
             visuals.widgets.noninteractive.bg_fill = BG_CARD;
             visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 41, 59);
             visuals.widgets.inactive.rounding = 7.0.into();
-            visuals.widgets.hovered.bg_fill = Color32::from_rgb(51, 65, 85);
+            visuals.widgets.hovered.bg_fill = Color32::from_rgb(37, 99, 235);
+            visuals.widgets.hovered.bg_stroke = Stroke::new(1.5_f32, Color32::from_rgb(96, 165, 250));
+            visuals.widgets.hovered.expansion = 1.0;
             visuals.widgets.hovered.rounding = 7.0.into();
             visuals.widgets.active.bg_fill = ACCENT_PRIMARY;
             visuals.widgets.active.rounding = 7.0.into();
@@ -569,7 +571,7 @@ impl BootLiteApp {
         let has_root = is_elevated();
         let logs = Arc::new(Mutex::new(Vec::new()));
 
-        push_log(&logs, "BootLite v0.6.6 initialized — Hardware Safety Locks ACTIVE");
+        push_log(&logs, "BootLite v0.6.7 initialized — Hardware Safety Locks ACTIVE");
         push_log(&logs, format!("I/O Backend: {}", os_io_mode_description()));
         if has_root {
             push_log(&logs, "Privilege Check: Running with Administrator / Root raw disk access");
@@ -1105,7 +1107,7 @@ impl eframe::App for BootLiteApp {
                             );
                             draw_pill(
                                 ui,
-                                "v0.6.6",
+                                "v0.6.7",
                                 Color32::from_rgb(30, 58, 138),
                                 ACCENT_GLOW,
                             );
@@ -2622,7 +2624,7 @@ impl eframe::App for BootLiteApp {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("BootLite Studio").size(16.0).strong().color(TEXT_MAIN));
-                                draw_pill(ui, "v0.6.6", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
+                                draw_pill(ui, "v0.6.7", Color32::from_rgb(30, 58, 138), ACCENT_GLOW);
                             });
                             ui.label(RichText::new("High-Performance Native Rust USB Flasher & Windows Deployment Studio").size(11.0).color(TEXT_SUB));
                         });
@@ -2653,7 +2655,7 @@ impl eframe::App for BootLiteApp {
                             open_external_url("https://github.com/namanrathi07/bootlite/issues/new/choose");
                         }
                         if small_slate_button(ui, "📋 Copy Info").clicked() {
-                            ctx.copy_text("BootLite v0.6.6 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
+                            ctx.copy_text("BootLite v0.6.7 by Naman Rathi (https://github.com/namanrathi07/bootlite)".to_string());
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
